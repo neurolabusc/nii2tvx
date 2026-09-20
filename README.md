@@ -33,6 +33,7 @@ make
 - `template.nii`: NIfTI image defining voxel space and affine transform.  
 - `tracksX.trk` / `tracksX.tck`: tractography files.  
 - Output: `.tvx` files, one per input streamline file.  
+- `-d` writes delta-encoded TVX (about 4× smaller, same query speed). See [tvx_format.md](tvx_format.md).  
 
 ### 2. Compute lesion overlaps with TVX files
 
@@ -45,14 +46,16 @@ make
 - `lesionX.nii`: binary lesion masks.  
 - `tracksX.tvx`: precomputed TVX files.  
 - Output: TSV table of lesion–tract overlap fractions.  
+- All TVX files are kept in memory across lesions; `-m` re-reads them per lesion to minimise memory.  
 
-## Automated Usage
+## Automated TVX creation
 
 The script `hcp2tvx.py` downloads the [HCP1065 Population-Averaged Tractography Atlas](https://brain.labsolver.org/hcp_trk_atlas.html) TRK files and converts them to match the template `MNI152_T1_1mm_brain_mask.nii.gz`.  
 You can adapt the script for other templates or streamlines.
 
 ```bash
-python hcp2tvx.py
+python hcp2tvx.py      # raw TVX
+python hcp2tvx.py -d   # delta-encoded TVX
 ```
 
 This creates `tvx` files in `hcp1065_avg_tracts_tvx/`.  
@@ -61,6 +64,18 @@ Use `lesion2tvx.py` to compute overlaps, providing a folder of TVX files and a f
 ```bash
 python lesion2tvx.py ./lesions ./hcp1065_avg_tracts_tvx > results.tsv
 ```
+
+
+## Example Usage
+
+Consider the provided lesion map `wM2208_T1w_lesion.nii.gz` that has been spatially normalized to the `MNI152_T1_1mm_brain_mask.nii.gz` template. We can identify the proportion damage to all the HCP1065 tracts.
+
+```
+nii2tvx ./example/wM2208_T1w_lesion.nii.gz ./hcp1065_avg_tracts_tvx/*.tvx > M2208.tsv
+```
+This will generate a tab-separated values file.
+
+
 
 ## Output Format
 
