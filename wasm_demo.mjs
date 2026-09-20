@@ -1,5 +1,5 @@
 // node wasm_demo.mjs lesion.nii[.gz] atlas.tvx   (build first: make wasm)
-// Prints the same TSV as the native tool. Shows the whole WASM surface: six calls.
+// Prints the same TSV as the native tool. Shows the whole WASM surface.
 import { readFileSync } from "node:fs";
 import { gunzipSync } from "node:zlib";
 import { basename } from "node:path";
@@ -27,7 +27,12 @@ const mask = M._mask_open(niiPtr, nii.length);
 M._free(niiPtr);
 if (!mask) process.exit(1);
 
-const fracs = names.map((_, k) => M._tvx_query(tvx, k, mask));
+const fracs = [];
+for (let k = 0; k < ntract; k++) {
+	const f = M._tvx_query(tvx, k, mask);
+	if (f < 0) process.exit(1); // grid mismatch or corrupt file; reason was printed to stderr
+	fracs.push(f);
+}
 M._mask_close(mask);
 M._tvx_close(tvx);
 

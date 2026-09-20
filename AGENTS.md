@@ -21,11 +21,12 @@ packing and `main`. Keep it that way; the WASM build must never need a filesyste
 
 ## Mode selection is by file extension
 
-`main` scans argv: `.nii`/`.nii.gz` are images, everything else is a tractogram. `.trk`/`.tck`
-inputs trigger conversion (image = template), `.tvx` inputs trigger queries (image = lesion).
-`-p out.tvx a.tvx b.tvx` packs records into one file and must be the first argument.
-Anything else starting with `-` prints help. There is no `-m`: the query walks the file
-bytes in place, so RAM is already the file size.
+`main` classifies argv once, then runs up to two straight-line passes: `convert_all` turns
+every `.trk`/`.tck` into a `.tvx` on the grid of the first NIfTI, and `query_all` treats
+every NIfTI (including that first one) as a lesion against every `.tvx`. `-p out.tvx
+a.tvx b.tvx` packs records into one file and must be the first argument. Anything else
+starting with `-` prints help. Unknown extensions abort before any work. There is no `-m`:
+the query walks the file bytes in place, so RAM is already the file size.
 
 ## Gotchas
 
@@ -36,21 +37,33 @@ bytes in place, so RAM is already the file size.
 - **Signature is uppercase `TVX\n`.** Files written by the pre-release builds (raw uint32,
   or delta without the record layout) are rejected as "Not a valid TVX file"; regenerate.
 - **Trust boundary is split in two on purpose.** `tvx_open` checks structure (sizes,
-  names, offsets) once; `walk` checks content (index range, varint bounds) per entry
-  because a corrupt stream can only be detected by decoding it. `tvx_query` returns -1 on
-  either; `nan` means a legitimately empty tract, so do not conflate them.
-- **Neighbour codes are relative to `dim`**, so a record only decodes against its own file
-  header. `pack` therefore refuses inputs whose header differs.
+  names, offsets, `dim` ≤ 32767, `ntract` against the buffer) once, in 64-bit arithmetic
+  because `size_t` is 32 bits under Emscripten and every wrap there was exploitable;
+  `walk` checks content (index range, code ≤ 27, varint ≤ 5 bytes) per entry because a
+  corrupt stream can only be detected by decoding it. `tvx_query` returns -1 on either;
+  `nan` means a legitimately empty tract, so do not conflate them. `mask_open` does its
+  size arithmetic in `double` for the same reason: `vox_offset` is a float and can be 1e30.
+- **`query_all` checks every grid before printing a row**, so a mismatch never leaves a
+  partial TSV on stdout. `tvx_query` re-checks; that duplication is deliberate.
 - **`mask_open` takes uncompressed NIfTI bytes.** The CLI gunzips through `gzread` in
   `read_file`; the WASM host must gunzip itself (`wasm_demo.mjs` uses Node `zlib`).
 - **Vertices that are NaN, Inf or beyond ±1e6 voxels are skipped** in `add_vertex` and
   break the streamline there; `raster` would otherwise spin forever (Inf gives a zero
   step, huge values stall below float epsilon).
+- **Conversion refuses a template with a singular sform or more than 2^32 voxels.**
+  `nifti_mat44_inverse` flags a singular input with `m[3][3] == 0`; without the check every
+  vertex lands in voxel 0 and the output looks plausible. The uint32 first voxel per
+  streamline is the 2^32 limit; the reader's `int64_t` walker has no such limit.
+- **`emit` codes neighbours from coordinate deltas, not from a linear-delta table lookup.**
+  Same bytes for every in-volume step, but it cannot be fooled by a linear delta that
+  coincidentally equals a neighbour offset across a row wrap, and it is O(1).
 - **The neighbour table is built from `dim`**, so a file's codes only make sense against
   its own header. Never copy a voxel stream between files with different `dim`.
-- **Header match is bitwise.** Lesion `dim` and sform must equal the template's exactly
-  (float `==`). Lesions must be resampled onto the template grid, not merely "in MNI". Images
-  with only a qform will fail the match. Default template: FSL `MNI152_T1_1mm_brain_mask`.
+- **Header match: `dim` exact, sform within 1e-4 relative.** `close_enough` absorbs float32
+  round-trips through other tools and still rejects a 0.05 % scale or a 0.02 mm shift, so a
+  "looks identical" failure is a qform-only file or a different template variant. Lesions
+  must be resampled onto the template grid, not merely "in MNI". Default template: FSL
+  `MNI152_T1_1mm_brain_mask`.
 - **Native endian, NIfTI-1 only, datatypes uint8/int16/uint16/float32.** Anything else:
   convert with niimath first. All TVX reads go through `gzread`, which handles plain and
   gzipped files alike.
@@ -75,9 +88,10 @@ bytes in place, so RAM is already the file size.
   an intercept cannot turn background into lesion.
 - **All TVX files are opened once**, on the first lesion, and stay mapped for every later
   lesion. Peak RAM is the sum of file sizes plus one mask.
-- **Output TSV goes to stdout together with diagnostic prints.** Conversion prints one line
-  per file; query mode prints only the table, header row once. `lesion2tvx.py -o`
-  post-processes stdout and expects the first column to be `id`.
+- **Only the TSV goes to stdout.** Every diagnostic, conversion progress line and pack
+  summary goes to stderr, so `> results.tsv` is always a clean table. In the WASM build
+  that is `Module.printErr`. `lesion2tvx.py -o` post-processes stdout and expects the first
+  column to be `id`.
 - **`write_tvx` writes next to the input** with the extension replaced by `.tvx`, one
   record named after the input file. `hcp2tvx.py` deletes and recreates both data
   directories on every run, then packs everything into `hcp1065_avg_tracts.tvx`.
@@ -85,10 +99,10 @@ bytes in place, so RAM is already the file size.
   `hcp1065_avg_tracts_tvx/` and `hcp1065_avg_tracts.tvx` live in the working tree and are
   gitignored, as are the emcc outputs.
 
-## Reference numbers (HCP1065, 88 tracts, rasterised)
+## Reference numbers (HCP1065, 87 tracts, rasterised)
 
 503 k streamlines, 84 M voxel entries, 88 MB packed, ≈ 65 ms per lesion, whole-atlas
-conversion ≈ 4 s, WASM module 19 KB. Use these as a regression baseline when changing the
+conversion ≈ 4 s, WASM module 21 KB. Use these as a regression baseline when changing the
 format or the query loop. The three lesions in `example/` against the packed atlas make a
 quick check: the packed file, the individual files and `node wasm_demo.mjs` must all agree.
 

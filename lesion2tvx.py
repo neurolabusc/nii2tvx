@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Usage:
-#   python lesion2tvx.py /path/to/lesions /path/to/tvx [-o results.tsv] [--dry-run] [--lesion-pattern "wsub*_desc-lesion_mask.nii.gz"]
+#   python lesion2tvx.py /path/to/lesions /path/to/tvx [-o results.tsv] [--lesion-pattern "wsub*_desc-lesion_mask.nii.gz"]
 #
 # Finds lesion NIfTI images under the first directory and all .tvx files under the
 # second (both recursively) and runs the 'nii2tvx' executable next to this script
@@ -35,7 +35,6 @@ def main():
     ap.add_argument("lesions_dir", type=Path, help="Directory containing lesion files (searched recursively)")
     ap.add_argument("tvx_dir", type=Path, help="Directory containing .tvx files (searched recursively)")
     ap.add_argument("-o", "--out", type=Path, default=None, help="Write TSV with SUBJECT/SESSION columns to this file")
-    ap.add_argument("--dry-run", action="store_true", help="Print the command without running it")
     ap.add_argument("--lesion-pattern", default="*.nii.gz", help="Glob for lesion files (default: *.nii.gz)")
     args = ap.parse_args()
 
@@ -47,11 +46,10 @@ def main():
         ap.error(f"No .tvx files under: {args.tvx_dir}")
 
     exe = Path(__file__).resolve().parent / "nii2tvx"
+    if not exe.exists():
+        sys.exit(f"ERROR: executable not found: {exe} (run make)")
     cmd = [str(exe), *map(str, lesions), *map(str, tvxs)]
 
-    if args.dry_run:
-        print(" ".join(cmd))
-        return 0
     if not args.out:
         return subprocess.run(cmd).returncode
 
@@ -60,8 +58,6 @@ def main():
         sys.stderr.write(proc.stderr + f"\nnii2tvx exited with code {proc.returncode}\n")
         return proc.returncode
     lines = proc.stdout.strip().splitlines()
-    if not lines:
-        return 0
     args.out.parent.mkdir(parents=True, exist_ok=True)
     with args.out.open("w", encoding="utf-8") as f:
         f.write("\t".join(["SUBJECT", "SESSION"] + lines[0].split("\t")[1:]) + "\n")

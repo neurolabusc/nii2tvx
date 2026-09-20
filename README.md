@@ -107,7 +107,7 @@ make wasm     # nii2tvx.mjs + nii2tvx.wasm (needs emcc); try: node wasm_demo.mjs
 
 ## WebAssembly
 
-The query core has no file I/O, so it compiles to a 19 KB WASM module exposing six functions (open, count, name, mask, query, close). A page fetches one packed atlas and gunzips it and the lesion in JavaScript; see `wasm_demo.mjs` for the calls.
+The query core has no file I/O, so it compiles to a 21 KB WASM module exposing seven functions (tvx_open, tvx_close, tvx_ntract, tvx_name, tvx_query, mask_open, mask_close). A page fetches one packed atlas and gunzips it and the lesion in JavaScript; see `wasm_demo.mjs` for the calls and [nii2tvx_wasm.md](nii2tvx_wasm.md) for the integration handoff.
 
 ## Alternatives, References and Links
 

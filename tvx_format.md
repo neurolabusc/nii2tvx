@@ -27,9 +27,10 @@ record[1]       ...
 | 48     | float32[4]  | srow_z    | NIfTI sform row 2 |
 | 64     | uint32      | ntract    | number of records that follow |
 
-`dim` and the sform are a fingerprint. A query image must match them bit for bit (float
-equality), otherwise the reader refuses. This is what guarantees the precomputed voxel
-indices are valid for the lesion image.
+`dim` and the sform are a fingerprint. A query image must match `dim` exactly and each
+sform entry to within 1e-4 relative (absolute below 1.0), otherwise the reader refuses.
+This is what guarantees the precomputed voxel indices are valid for the lesion image; the
+tolerance only absorbs float32 round-trips through other tools.
 
 ### tract_header
 
@@ -56,6 +57,7 @@ each a delta from the previous voxel:
   `dx,dy,dz ∈ {−1,0,1}`. Code 13 (zero delta) is never written.
 - code `27`: escape, followed by the delta as a zigzag LEB128 varint
   (`(d<<1) ^ (d>>63)`, 7 bits per byte, high bit set = more bytes follow, at most 5 bytes).
+- codes `28..255` are invalid; a reader treats them as corruption.
 
 Nearly every within-streamline step is a neighbour move, so a streamline costs 4 bytes plus
 about one byte per voxel. The stream is padded with zero bytes to a multiple of 4 so the
@@ -123,7 +125,7 @@ float   tvx_query(tvx_t*, int k, mask_t*)      fraction; -1 on grid mismatch or 
 void    tvx_close(tvx_t*), mask_close(mask_t*)
 ```
 
-`make wasm` exports exactly these plus `malloc`/`free`; `wasm_demo.mjs` shows the six calls
+`make wasm` exports exactly these plus `malloc`/`free`; `wasm_demo.mjs` shows the calls
 from Node. The command-line tool is the same functions wrapped in file reading.
 
 ## Reference numbers (HCP1065 atlas, MNI152 1 mm, 182×218×182, 87 tracts)
@@ -138,7 +140,7 @@ from Node. The command-line tool is the same functions wrapped in file reading.
 | 20 lesions (18.7 k voxels each) against the packed atlas | 1.4 s |
 | one lesion, process start to exit | 0.09 s |
 | peak RSS | ≈ file size + mask |
-| WASM module | 19 KB |
+| WASM module | 21 KB |
 | conversion of the whole atlas | 4.3 s |
 
 # Evaluation
@@ -166,9 +168,9 @@ from Node. The command-line tool is the same functions wrapped in file reading.
 2. **No spatial bounds.** A per-tract bounding box would let the query skip tracts that
    cannot intersect the lesion. Many tracts return exactly 0 for a typical lesion; today
    each still costs a full scan.
-3. **The grid check is bitwise.** A mask on the same grid whose sform differs in the last
-   float bit, or that carries only a qform, is refused. Correct but unfriendly for
-   browser-drawn masks; a tolerance or a resample-on-load step is the likely next request.
+3. **qform-only masks are refused.** The check reads the sform only; an image whose grid
+   is expressed solely through the qform fails even when it is the same grid. A
+   qform-to-sform fallback or a resample-on-load step is the likely next request.
 4. **Native endian only**, and record sizes are uint32, so a single tract is limited to
    4 GB of stream. Neither has bitten yet.
 
