@@ -15,7 +15,7 @@ By identifying which fiber bundles are intersected by lesions, it highlights lik
 
 ### 0. Compile nii2tvx
 
-You need to compile the 
+Clone and build:
 
 ```bash
 git clone https://github.com/neurolabusc/nii2tvx
@@ -33,7 +33,7 @@ make
 - `template.nii`: NIfTI image defining voxel space and affine transform.  
 - `tracksX.trk` / `tracksX.tck`: tractography files.  
 - Output: `.tvx` files, one per input streamline file.  
-- `-d` writes delta-encoded TVX (about 4× smaller, same query speed). See [tvx_format.md](tvx_format.md).  
+- Format details: [tvx_format.md](tvx_format.md).  
 
 ### 2. Compute lesion overlaps with TVX files
 
@@ -54,8 +54,7 @@ The script `hcp2tvx.py` downloads the [HCP1065 Population-Averaged Tractography 
 You can adapt the script for other templates or streamlines.
 
 ```bash
-python hcp2tvx.py      # raw TVX
-python hcp2tvx.py -d   # delta-encoded TVX
+python hcp2tvx.py
 ```
 
 This creates `tvx` files in `hcp1065_avg_tracts_tvx/`.  
@@ -98,17 +97,11 @@ Optimized build:
 gcc -O3 nii2tvx.c -o nii2tvx -lz -lm
 ```
 
-Debug build with AddressSanitizer:
-
-```bash
-gcc -O1 -g -fsanitize=address -fno-omit-frame-pointer nii2tvx.c -o nii2tvx -lz -lm
-```
-
 Or use the Makefile:
 
 ```bash
 make          # optimized build
-make sanitize # debug build
+make sanitize # ASan + UBSan build as nii2tvx_asan
 ```
 
 ## Alternatives, References and Links

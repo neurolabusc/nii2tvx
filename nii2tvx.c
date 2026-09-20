@@ -1,17 +1,11 @@
-// gcc -O3 nii2tvx.c -o nii2tvx -lz -lm
-// gcc -O1 -g -fsanitize=address -fno-omit-frame-pointer nii2tvx.c -o nii2tvx -lz -lm
 #include <stdio.h>
-//#include <ctype.h>
 #include <stdlib.h>
-//#include <stdint.h>
 #include <math.h>
 #include <string.h>
-#include "nifti1.h"
+#include <stdbool.h>
+#include <unistd.h>
 #include <zlib.h>
-#include<stdbool.h>
-#ifdef _MSC_VER
-	#define F_OK 0 
-#endif
+#include "nifti1.h"
 
 #define STR_HELPER(x) #x
 #define STR(x) STR_HELPER(x)
@@ -34,198 +28,70 @@
 #else
 	#define kCPUsuf " " //unknown CPU
 #endif
-#define kdate "v1.0.20240101"
+#define kdate "v1.1.20260920"
 
-bool is_ext(const char *filename, const char *extension) {
-	size_t filename_len = strlen(filename);
-	size_t extension_len = strlen(extension);
-	// Check if the filename is long enough to contain the extension
-	if (filename_len >= extension_len) {
-		const char *file_extension = filename + (filename_len - extension_len);
-		// Compare the file extension with the specified extension
-		if (strcmp(file_extension, extension) == 0) {
-			return true;
-		}
-	}
-	return false;
+static bool is_ext(const char *filename, const char *extension) {
+	size_t n = strlen(filename), m = strlen(extension);
+	return n >= m && strcmp(filename + n - m, extension) == 0;
 }
 
-void strip_ext(char *fname){
-	char *end = fname + strlen(fname);
-	while (end > fname && *end != '.' && *end != '\\' && *end != '/') {
-		--end;
-	}
-	if ((end > fname && *end == '.') &&
-		(*(end - 1) != '\\' && *(end - 1) != '/')) {
-		*end = '\0';
-	}
-}
-
-void strip_ext2(char *fname) {
-	char *end = fname + strlen(fname);
-	// Check if the file has ".gz" extension
-	if (end >= fname + 3 && strcmp(end - 3, ".gz") == 0)
-		end -= 4; // Move end back by 4 characters to exclude ".gz"
-	while (end > fname && *end != '.' && *end != '\\' && *end != '/') {
-		--end;
-	}
-	if ((end > fname && *end == '.') &&
-		(*(end - 1) != '\\' && *(end - 1) != '/')) {
-		*end = '\0';
-	}
-}
-
-const char *basenamex(const char *path) {
+static const char *basenamex(const char *path) {
 	const char *s = strrchr(path, '/');
 	return s ? s + 1 : path;
 }
 
-float * load_nii(const char *fnm, nifti_1_header * hdr) {
-	char imgnm[768], hdrnm[768], basenm[768], ext[768] = "";
-	strcpy(basenm, fnm);
-	strcpy(imgnm, fnm);
-	strcpy(hdrnm, fnm);
-	strip_ext(basenm); // ~/file.nii -> ~/file
-	if (strlen(fnm) > strlen(basenm))
-		strcpy(ext, fnm + strlen(basenm));
-	if (strstr(ext, ".hdr")) {
-		strcpy(imgnm, basenm);
-		strcat(imgnm, ".img");
-	}
-	if (strstr(ext, ".img")) {
-		strcpy(hdrnm, basenm);
-		strcat(hdrnm, ".hdr");
-	}
-	if( access( hdrnm, F_OK ) != 0 ) {
-		printf("Unable to find a file named %s\n", hdrnm);
-		return NULL;
-	}
-	if( access( imgnm, F_OK ) != 0 ) {
-		printf("Unable to find a file named %s\n", imgnm);
-		return NULL;
-	}
-	bool isGz = false;
-	if (strstr(ext, ".gz")) {
-		gzFile fgz = gzopen(hdrnm, "r");
-		if (! fgz) {
-			printf("gzopen error %s\n", hdrnm);
-			return NULL;
-		}
-		int bytes_read = gzread(fgz, hdr, sizeof(nifti_1_header));
-		gzclose(fgz);
-		isGz = true;
-		if (bytes_read < sizeof(nifti_1_header)) return NULL;
-	}
-	if (!isGz) {
-		FILE *fp = fopen(hdrnm,"rb");
-		if (fp == NULL) {
-			printf("Unable to open %s\n", hdrnm);
-			return NULL;
-		}
-		size_t bytes_read = fread(hdr, sizeof(nifti_1_header), 1, fp);
-		fclose(fp);
-		if (bytes_read <= 0) {
-			printf("Unable to read %s\n", hdrnm);
-			return NULL;
-		}
-	}
-	uint16_t sig = 348;
-	uint16_t fwd = hdr->sizeof_hdr;
-	uint16_t rev = (fwd & 0xff) << 8 | ((fwd & 0xff00) >> 8);
-	if (rev == sig) {
-		printf("Demo only reads native endian NIfTI (solution: use niimath)\n");
-		return NULL;
-	}
-	if (fwd != sig) {
-		printf("Only compiled to read uncompressed NIfTI (solution: 'gzip -d \"%s\"')\n", hdrnm);
-		return NULL;
-	}
-	if ((hdr->datatype != DT_UINT8) && (hdr->datatype != DT_UINT16) && (hdr->datatype != DT_INT16) && (hdr->datatype != DT_FLOAT32)) {
-		printf("Demo does not support this data type (solution: use niimath)\n");
-		return NULL;
-	}
-	int nvox = hdr->dim[1]*hdr->dim[2]*hdr->dim[3];
-	if (hdr->scl_slope == 0.0) hdr->scl_slope = 1.0;
-	float * img32 = (float *) malloc(nvox*sizeof(float));
-	int bpp = 2;
-	if (hdr->datatype == DT_UINT8)
-		bpp = 1;
-	if (hdr->datatype == DT_FLOAT32)
-		bpp = 4;
-	void * imgRaw = (void *) malloc(nvox*bpp);
-	if (isGz) {
-		gzFile fgz = gzopen(hdrnm, "r");
-		if (! fgz)
-			return NULL;
-		if (hdr->vox_offset > 0) { //skip header
-			int nskip = round(hdr->vox_offset);
-			void * skip = (void *) malloc(nskip);
-			int bytes_read = gzread (fgz, skip, nskip);
-			free(skip);
-			if (bytes_read != nskip)
-				return NULL;
-		}
-		int bytes_read = gzread(fgz, imgRaw, nvox*bpp);
-		if (bytes_read != (nvox*bpp))
-			return NULL;
-		gzclose(fgz);
-	} else {
-		FILE *fp = fopen(imgnm,"rb");
-		if (fp == NULL)
-			return NULL;
-		fseek(fp, (int)hdr->vox_offset, SEEK_SET);
-		size_t sz = fread(imgRaw, nvox*bpp, 1, fp);
-		fclose(fp);
-		if (sz <= 0) return NULL;
-	}
-	if (hdr->datatype == DT_UINT8) {
-		uint8_t * img8 = (uint8_t *) imgRaw;
-		for (int i = 0; i < nvox; i++)
-			img32[i] = (img8[i] * hdr->scl_slope) + hdr->scl_inter;
-	} else if (hdr->datatype == DT_UINT16) {
-		uint16_t * img16 = (uint16_t *) imgRaw;
-		for (int i = 0; i < nvox; i++)
-			img32[i] = (img16[i] * hdr->scl_slope) + hdr->scl_inter;
-	} else if (hdr->datatype == DT_INT16) {
-		int16_t * img16 = (int16_t *) imgRaw;
-		for (int i = 0; i < nvox; i++)
-			img32[i] = (img16[i] * hdr->scl_slope) + hdr->scl_inter;
-	} else {
-		float * img32w = (float *) imgRaw;
-		for (int i = 0; i < nvox; i++)
-			img32[i] = (img32w[i] * hdr->scl_slope) + hdr->scl_inter;
-	}
-	free(imgRaw);
-	return img32;
+static void strip_ext(char *fname) {
+	char *dot = strrchr(fname, '.');
+	if (dot > basenamex(fname))
+		*dot = '\0';
 }
 
-uint8_t * load_nii_mask(const char *fnm, nifti_1_header * hdr) {
-	//image data is binarized as 0 or 1 (not zero)
-	float * img32 = load_nii(fnm, hdr);
-	if (img32 == NULL) {
+static void strip_ext2(char *fname) { // also peels .gz: file.nii.gz -> file
+	if (is_ext(fname, ".gz"))
+		fname[strlen(fname) - 3] = '\0';
+	strip_ext(fname);
+}
+
+// image binarized to 0/1 (any non-zero voxel); gzread handles plain and gzipped NIfTI alike
+static uint8_t *load_nii_mask(const char *fnm, nifti_1_header *hdr) {
+	gzFile fgz = gzopen(fnm, "rb");
+	if (!fgz || gzread(fgz, hdr, sizeof(nifti_1_header)) != sizeof(nifti_1_header)) {
+		printf("Unable to read %s\n", fnm);
 		return NULL;
 	}
-	int nvox = hdr->dim[1]*hdr->dim[2]*hdr->dim[3];
-	uint8_t * img = (uint8_t*)calloc(nvox, sizeof(uint8_t));
-	
-	for (int i = 0; i < nvox; i++)
-		if (img32[i] != 0.0)
-			img[i] = 1;
-	free(img32);
+	if (hdr->sizeof_hdr != 348) {
+		printf("Not a native-endian NIfTI-1 image (solution: use niimath)\n");
+		return NULL;
+	}
+	if (hdr->dim[1] < 1 || hdr->dim[2] < 1 || hdr->dim[3] < 1) {
+		printf("Bad image dimensions in %s\n", fnm);
+		return NULL;
+	}
+	int bpp = hdr->datatype == DT_UINT8 ? 1 : hdr->datatype == DT_INT16 || hdr->datatype == DT_UINT16 ? 2 : hdr->datatype == DT_FLOAT32 ? 4 : 0;
+	if (bpp == 0) {
+		printf("Unsupported datatype %d (solution: use niimath)\n", hdr->datatype);
+		return NULL;
+	}
+	size_t nvox = (size_t)hdr->dim[1] * hdr->dim[2] * hdr->dim[3];
+	void *raw = malloc(nvox * bpp);
+	gzseek(fgz, (z_off_t)hdr->vox_offset, SEEK_SET);
+	int nread = gzread(fgz, raw, nvox * bpp);
+	gzclose(fgz);
+	if (nread != (int)(nvox * bpp)) {
+		printf("Unable to read %s\n", fnm);
+		free(raw);
+		return NULL;
+	}
+	uint8_t *img = malloc(nvox);
+	for (size_t i = 0; i < nvox; i++)
+		img[i] = bpp == 1 ? ((uint8_t *)raw)[i] != 0 : bpp == 2 ? ((uint16_t *)raw)[i] != 0 : ((float *)raw)[i] != 0;
+	free(raw);
 	return img;
 }
 
 typedef struct {/** 4x4 matrix struct **/
 	float m[4][4];
 } mat44;
-
-typedef struct {
-	int32_t v[3];
-} vec3i;
-
-typedef struct { /** x4 vector struct **/
-	float v[4];
-} vec4;
 
 mat44 nifti_mat44_mul( mat44 A , mat44 B ) {
 	mat44 C ; int i,j,k;
@@ -236,19 +102,6 @@ mat44 nifti_mat44_mul( mat44 A , mat44 B ) {
 				C.m[i][j] += A.m[i][k] * B.m[k][j];
 		}
 	return C;
-}
-
-vec3i nifti_xyz_mat44_mul(float x, float y, float z, mat44 m) { //multiply vector * 4x4matrix
-	vec4 v = {{x, y, z, 1}};
-	vec4 vO;
-	for (int i = 0; i < 4; i++) { //multiply Pcrs * m
-		vO.v[i] = 0;
-		for (int j = 0; j < 4; j++)
-			vO.v[i] += m.m[i][j] * v.v[j];
-	}
-	
-	vec3i vOi = {{round(vO.v[0]), round(vO.v[1]), round(vO.v[2])}};
-	return vOi;
 }
 
 mat44 nifti_mat44_inverse( mat44 R ) {
@@ -336,8 +189,7 @@ struct trk_header { //always little endian
 #pragma pack()
 typedef struct trk_header trk_header;
 
-#pragma pack(2)
-struct tvx_header { //always little endian
+struct tvx_header { //always little endian; all fields 4 bytes so no padding
 	uint32_t signature; //must be 175666804 "tvx\n"
 	uint32_t dim[3]; //correspond to NIfTI dim[1..3]
 	float srow_x[4] ; // 1st row affine transform.
@@ -346,19 +198,18 @@ struct tvx_header { //always little endian
 	uint32_t noffset; //number of offsets (streamlines +1)
 	uint32_t nvoxel; //number of voxels stored for all streamlines
 };
-#pragma pack()
 typedef struct tvx_header tvx_header;
 
 
-#define kSigRaw 0x0A787674   // "tvx\n": uint32 voxel indices
-#define kSigDelta 0x0A647674 // "tvd\n": one byte per voxel step, see tvx_format.md
+#define kSig 0x0A585654 // "TVX\n"
 
 typedef struct {
 	tvx_header h;
 	uint32_t *offsets, *verts;
 } tvx_t;
 
-// ---- delta codec: 26 neighbour codes (0..26, 13 unused) + escape 27 followed by zigzag LEB128 delta
+// ---- voxel codec: 27 neighbour codes (13 = same voxel, only at a streamline boundary)
+//      + escape 27 followed by zigzag LEB128 delta
 static void neighbour_table(int64_t tab[27], int nx, int ny) {
 	for (int c = 0; c < 27; c++)
 		tab[c] = (c % 3 - 1) + (int64_t)(c / 3 % 3 - 1) * nx + (int64_t)(c / 9 - 1) * nx * ny;
@@ -373,7 +224,7 @@ static size_t delta_encode(const tvx_t *t, uint8_t *out) {
 		int64_t d = (int64_t)t->verts[i] - prev;
 		prev = t->verts[i];
 		int c = 0;
-		while (c < 27 && (c == 13 || tab[c] != d))
+		while (c < 27 && tab[c] != d)
 			c++;
 		*p++ = c;
 		if (c == 27) {
@@ -386,9 +237,11 @@ static size_t delta_encode(const tvx_t *t, uint8_t *out) {
 	return p - out;
 }
 
-static void delta_decode(tvx_t *t, const uint8_t *in) {
+// false if any decoded index is outside the volume (corrupt or foreign file)
+static bool delta_decode(tvx_t *t, const uint8_t *in) {
 	int64_t tab[27];
 	neighbour_table(tab, t->h.dim[0], t->h.dim[1]);
+	int64_t nvox = (int64_t)t->h.dim[0] * t->h.dim[1] * t->h.dim[2];
 	int64_t prev = 0;
 	for (uint32_t i = 0; i < t->h.nvoxel; i++) {
 		int c = *in++;
@@ -396,16 +249,18 @@ static void delta_decode(tvx_t *t, const uint8_t *in) {
 			prev += tab[c];
 		else {
 			uint64_t z = 0;
-			int shift = 0;
-			for (;; shift += 7) {
+			for (int shift = 0; shift < 35; shift += 7) { // at most 5 bytes: |delta| < 2^32
 				uint8_t b = *in++;
 				z |= (uint64_t)(b & 0x7F) << shift;
 				if (!(b & 0x80)) break;
 			}
 			prev += (int64_t)(z >> 1) ^ -(int64_t)(z & 1);
 		}
+		if (prev < 0 || prev >= nvox)
+			return false;
 		t->verts[i] = prev;
 	}
+	return true;
 }
 
 // ---- conversion: streamline vertices (mm) -> voxel index runs
@@ -420,7 +275,7 @@ typedef struct {
 
 static void writer_init(tvx_writer *w, nifti_1_header *hdr, mat44 inv) {
 	memset(w, 0, sizeof(*w));
-	w->t.h.signature = kSigRaw;
+	w->t.h.signature = kSig;
 	for (int i = 0; i < 3; i++) w->t.h.dim[i] = hdr->dim[i + 1];
 	for (int i = 0; i < 4; i++) {
 		w->t.h.srow_x[i] = hdr->srow_x[i];
@@ -464,7 +319,9 @@ static void raster(tvx_writer *w, const float *a, const float *b) {
 	}
 	emit(w, v[0], v[1], v[2]);
 	for (;;) {
-		int k = tMax[0] < tMax[1] ? (tMax[0] < tMax[2] ? 0 : 2) : (tMax[1] < tMax[2] ? 1 : 2);
+		int k = 0; // on ties step the higher axis first (keeps output stable across versions)
+		if (tMax[1] <= tMax[k]) k = 1;
+		if (tMax[2] <= tMax[k]) k = 2;
 		if (tMax[k] > 1.0f)
 			break;
 		v[k] += step[k];
@@ -478,6 +335,11 @@ static void add_vertex(tvx_writer *w, const float *xyz) {
 	for (int i = 0; i < 3; i++)
 		p[i] = xyz[0] * w->inv.m[i][0] + xyz[1] * w->inv.m[i][1] + xyz[2] * w->inv.m[i][2] + w->inv.m[i][3];
 	w->nvert++;
+	for (int i = 0; i < 3; i++)
+		if (!(fabsf(p[i]) < 1e6f)) { // NaN, Inf or far outside any volume: raster would not terminate
+			w->has_prev = false;
+			return;
+		}
 	raster(w, w->has_prev ? w->pv : p, p);
 	memcpy(w->pv, p, sizeof(p));
 	w->has_prev = true;
@@ -495,8 +357,8 @@ static void end_streamline(tvx_writer *w) {
 	w->prev = -1;
 }
 
-static void write_tvx(const char *fnm, tvx_writer *w, bool delta) {
-	char outnm[768];
+static void write_tvx(const char *fnm, tvx_writer *w) {
+	char *outnm = malloc(strlen(fnm) + 5);
 	strcpy(outnm, fnm);
 	strip_ext(outnm);
 	strcat(outnm, ".tvx");
@@ -506,22 +368,19 @@ static void write_tvx(const char *fnm, tvx_writer *w, bool delta) {
 		exit(EXIT_FAILURE);
 	}
 	tvx_t *t = &w->t;
-	t->h.signature = delta ? kSigDelta : kSigRaw;
 	fwrite(&t->h, sizeof(t->h), 1, fp);
 	fwrite(t->offsets, sizeof(uint32_t), t->h.noffset, fp);
-	if (delta) {
-		uint8_t *buf = malloc((size_t)t->h.nvoxel * 11); // worst case: escape + 10-byte varint
-		fwrite(buf, 1, delta_encode(t, buf), fp);
-		free(buf);
-	} else
-		fwrite(t->verts, sizeof(uint32_t), t->h.nvoxel, fp);
+	uint8_t *buf = malloc((size_t)t->h.nvoxel * 6); // worst case: escape + 5-byte varint (|delta| < 2^32)
+	fwrite(buf, 1, delta_encode(t, buf), fp);
+	free(buf);
 	fclose(fp);
 	printf("%s\t%u\tstreamlines\t%zu\tvertices\t%u\tvoxels\n", outnm, t->h.noffset - 1, w->nvert, t->h.nvoxel);
+	free(outnm);
 	free(t->offsets);
 	free(t->verts);
 }
 
-static int load_trk(const char *fnm, nifti_1_header *hdr, bool delta) {
+static int load_trk(const char *fnm, nifti_1_header *hdr) {
 	//https://trackvis.org/docs/?subsect=fileformat
 	FILE *fp = fopen(fnm, "rb");
 	if (fp == NULL)
@@ -534,8 +393,8 @@ static int load_trk(const char *fnm, nifti_1_header *hdr, bool delta) {
 		fclose(fp);
 		return EXIT_FAILURE;
 	}
-	if (thdr.vox_to_ras.m[3][3] == 0.0) {
-		printf("TRK vox_to_ras not set\n");
+	if (thdr.vox_to_ras.m[3][3] == 0.0 || thdr.n_scalars < 0 || thdr.n_properties < 0) {
+		printf("TRK vox_to_ras not set or header corrupt\n");
 		fclose(fp);
 		return EXIT_FAILURE;
 	}
@@ -552,7 +411,7 @@ static int load_trk(const char *fnm, nifti_1_header *hdr, bool delta) {
 	size_t bufcap = 0;
 	for (int i = 0; i < thdr.n_count; i++) {
 		int32_t m;
-		if (fread(&m, sizeof(m), 1, fp) != 1)
+		if (fread(&m, sizeof(m), 1, fp) != 1 || m < 0)
 			break;
 		if ((size_t)m * stride > bufcap)
 			buf = realloc(buf, (bufcap = (size_t)m * stride) * sizeof(float));
@@ -565,11 +424,11 @@ static int load_trk(const char *fnm, nifti_1_header *hdr, bool delta) {
 	}
 	free(buf);
 	fclose(fp);
-	write_tvx(fnm, &w, delta);
+	write_tvx(fnm, &w);
 	return EXIT_SUCCESS;
 }
 
-static int load_tck(const char *fnm, nifti_1_header *hdr, bool delta) {
+static int load_tck(const char *fnm, nifti_1_header *hdr) {
 	FILE *fp = fopen(fnm, "rb");
 	if (fp == NULL)
 		return EXIT_FAILURE;
@@ -594,7 +453,7 @@ static int load_tck(const char *fnm, nifti_1_header *hdr, bool delta) {
 	}
 	end_streamline(&w);
 	fclose(fp);
-	write_tvx(fnm, &w, delta);
+	write_tvx(fnm, &w);
 	return EXIT_SUCCESS;
 }
 
@@ -602,24 +461,23 @@ static int load_tck(const char *fnm, nifti_1_header *hdr, bool delta) {
 static bool read_tvx(const char *fnm, tvx_t *t) {
 	// gzread transparently reads both raw and gzipped files
 	gzFile fgz = gzopen(fnm, "rb");
-	if (!fgz || gzread(fgz, &t->h, sizeof(t->h)) != sizeof(t->h) || (t->h.signature != kSigRaw && t->h.signature != kSigDelta)) {
+	if (!fgz || gzread(fgz, &t->h, sizeof(t->h)) != sizeof(t->h) || t->h.signature != kSig || t->h.noffset < 1) {
 		printf("Not a TVX file: %s\n", fnm);
 		return false;
 	}
 	gzbuffer(fgz, 1 << 20);
-	size_t nbytes = t->h.signature == kSigRaw ? (size_t)t->h.nvoxel * 4 : (size_t)t->h.nvoxel * 11;
 	t->offsets = malloc(sizeof(uint32_t) * t->h.noffset);
 	t->verts = malloc(sizeof(uint32_t) * t->h.nvoxel);
-	gzread(fgz, t->offsets, sizeof(uint32_t) * t->h.noffset);
-	if (t->h.signature == kSigDelta) {
-		uint8_t *buf = malloc(nbytes);
-		gzread(fgz, buf, nbytes);
-		delta_decode(t, buf);
-		free(buf);
-	} else
-		gzread(fgz, t->verts, nbytes);
+	uint8_t *buf = malloc((size_t)t->h.nvoxel * 6);
+	bool ok = gzread(fgz, t->offsets, sizeof(uint32_t) * t->h.noffset) == (int)(sizeof(uint32_t) * t->h.noffset);
+	ok = ok && gzread(fgz, buf, (size_t)t->h.nvoxel * 6) > 0 && delta_decode(t, buf);
+	for (uint32_t i = 1; ok && i < t->h.noffset; i++)
+		ok = t->offsets[i - 1] <= t->offsets[i] && t->offsets[i] <= t->h.nvoxel;
+	free(buf);
 	gzclose(fgz);
-	return true;
+	if (!ok)
+		printf("Corrupt TVX file: %s\n", fnm);
+	return ok;
 }
 
 static void free_tvx(tvx_t *t) {
@@ -662,7 +520,7 @@ static void show_help(char *fname) {
 	printf("Computes overlap of lesion (NIfTI) and tracts (tvx).\n");
 	printf("Usage to create TVX file(s)\n");
 	printf(" %s template.nii tracks1.tck tracks2.tck\n", fname);
-	printf(" %s -d template.nii tracks1.trk   (-d: delta-encoded TVX, ~4x smaller)\n", fname);
+	printf(" %s template.nii tracks1.trk\n", fname);
 	printf("Usage to compute lesion overlap(s) with TVX file(s)\n");
 	printf(" %s lesion.nii tracks1.tvx tracks2.tvx\n", fname);
 	printf(" %s lesion1.nii lesion2.nii tracks1.tvx tracks2.tvx\n", fname);
@@ -676,11 +534,10 @@ static bool is_nifti(const char *fnm) {
 }
 
 int main(int argc, char **argv) {
-	bool delta = false, lowmem = false;
+	bool lowmem = false;
 	int first = 1;
 	for (; first < argc && argv[first][0] == '-'; first++) {
-		if (strcmp(argv[first], "-d") == 0) delta = true;
-		else if (strcmp(argv[first], "-m") == 0) lowmem = true;
+		if (strcmp(argv[first], "-m") == 0) lowmem = true;
 		else show_help(argv[0]);
 	}
 	int nnifti = 0, ntrack = 0;
@@ -699,25 +556,24 @@ int main(int argc, char **argv) {
 	tvx_t *tvx = calloc(argc, sizeof(tvx_t)); // indexed by argv position, loaded on first use
 	float *fracs = malloc(sizeof(float) * argc);
 	int *idxs = malloc(sizeof(int) * argc);
-	bool header_written = false;
+	bool header_written = false, is_template = true; // TRK/TCK are converted once, against the first NIfTI
 	for (int i = first; i < argc; i++) {
 		if (!is_nifti(argv[i]))
 			continue;
 		nifti_1_header hdr;
 		uint8_t *img = load_nii_mask(argv[i], &hdr);
-		if (img == NULL) {
-			printf("Unable to load NIfTI image %s\n", argv[i]);
+		if (img == NULL)
 			exit(EXIT_FAILURE);
-		}
 		int nfrac = 0;
 		for (int j = first; j < argc; j++) {
 			if (is_nifti(argv[j]))
 				continue;
-			if (is_ext(argv[j], ".tck"))
-				load_tck(argv[j], &hdr, delta);
-			else if (is_ext(argv[j], ".trk"))
-				load_trk(argv[j], &hdr, delta);
-			else if (is_ext(argv[j], ".tvx")) {
+			if (is_ext(argv[j], ".tck") || is_ext(argv[j], ".trk")) {
+				if (is_template && (is_ext(argv[j], ".tck") ? load_tck : load_trk)(argv[j], &hdr) != EXIT_SUCCESS) {
+					printf("Unable to convert %s\n", argv[j]);
+					exit(EXIT_FAILURE);
+				}
+			} else if (is_ext(argv[j], ".tvx")) {
 				if (!tvx[j].verts && !read_tvx(argv[j], &tvx[j]))
 					exit(EXIT_FAILURE);
 				if (!tvx_matches(&tvx[j], &hdr))
@@ -732,22 +588,24 @@ int main(int argc, char **argv) {
 			}
 		}
 		free(img);
+		is_template = false;
 		if (nfrac == 0)
 			continue;
-		char basenm[768];
 		if (!header_written) {
 			header_written = true;
 			printf("id");
 			for (int k = 0; k < nfrac; k++) {
-				strcpy(basenm, argv[idxs[k]]);
+				char *basenm = strdup(argv[idxs[k]]);
 				strip_ext2(basenm);
 				printf("\t%s", basenamex(basenm));
+				free(basenm);
 			}
 			printf("\n");
 		}
-		strcpy(basenm, argv[i]);
+		char *basenm = strdup(argv[i]);
 		strip_ext2(basenm);
 		printf("%s", basenamex(basenm));
+		free(basenm);
 		for (int k = 0; k < nfrac; k++)
 			printf("\t%g", fracs[k]);
 		printf("\n");
