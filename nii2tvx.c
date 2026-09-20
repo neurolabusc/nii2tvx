@@ -3,9 +3,16 @@
 #include <math.h>
 #include <string.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <unistd.h>
 #include <zlib.h>
 #include "nifti1.h"
+#ifdef __EMSCRIPTEN__
+	#include <emscripten.h>
+	#define EXPORT EMSCRIPTEN_KEEPALIVE
+#else
+	#define EXPORT
+#endif
 
 #define STR_HELPER(x) #x
 #define STR(x) STR_HELPER(x)
@@ -53,41 +60,6 @@ static void strip_ext2(char *fname) { // also peels .gz: file.nii.gz -> file
 }
 
 // image binarized to 0/1 (any non-zero voxel); gzread handles plain and gzipped NIfTI alike
-static uint8_t *load_nii_mask(const char *fnm, nifti_1_header *hdr) {
-	gzFile fgz = gzopen(fnm, "rb");
-	if (!fgz || gzread(fgz, hdr, sizeof(nifti_1_header)) != sizeof(nifti_1_header)) {
-		printf("Unable to read %s\n", fnm);
-		return NULL;
-	}
-	if (hdr->sizeof_hdr != 348) {
-		printf("Not a native-endian NIfTI-1 image (solution: use niimath)\n");
-		return NULL;
-	}
-	if (hdr->dim[1] < 1 || hdr->dim[2] < 1 || hdr->dim[3] < 1) {
-		printf("Bad image dimensions in %s\n", fnm);
-		return NULL;
-	}
-	int bpp = hdr->datatype == DT_UINT8 ? 1 : hdr->datatype == DT_INT16 || hdr->datatype == DT_UINT16 ? 2 : hdr->datatype == DT_FLOAT32 ? 4 : 0;
-	if (bpp == 0) {
-		printf("Unsupported datatype %d (solution: use niimath)\n", hdr->datatype);
-		return NULL;
-	}
-	size_t nvox = (size_t)hdr->dim[1] * hdr->dim[2] * hdr->dim[3];
-	void *raw = malloc(nvox * bpp);
-	gzseek(fgz, (z_off_t)hdr->vox_offset, SEEK_SET);
-	int nread = gzread(fgz, raw, nvox * bpp);
-	gzclose(fgz);
-	if (nread != (int)(nvox * bpp)) {
-		printf("Unable to read %s\n", fnm);
-		free(raw);
-		return NULL;
-	}
-	uint8_t *img = malloc(nvox);
-	for (size_t i = 0; i < nvox; i++)
-		img[i] = bpp == 1 ? ((uint8_t *)raw)[i] != 0 : bpp == 2 ? ((uint16_t *)raw)[i] != 0 : ((float *)raw)[i] != 0;
-	free(raw);
-	return img;
-}
 
 typedef struct {/** 4x4 matrix struct **/
 	float m[4][4];
@@ -189,120 +161,305 @@ struct trk_header { //always little endian
 #pragma pack()
 typedef struct trk_header trk_header;
 
-struct tvx_header { //always little endian; all fields 4 bytes so no padding
-	uint32_t signature; //must be 175666804 "tvx\n"
-	uint32_t dim[3]; //correspond to NIfTI dim[1..3]
-	float srow_x[4] ; // 1st row affine transform.
-	float srow_y[4] ; // 2nd row affine transform.
-	float srow_z[4] ; // 3rd row affine transform.
-	uint32_t noffset; //number of offsets (streamlines +1)
-	uint32_t nvoxel; //number of voxels stored for all streamlines
-};
-typedef struct tvx_header tvx_header;
-
-
+// ============================================================================
+// Core: buffer in, numbers out. No file I/O, no zlib. This is also the WASM surface.
+// ============================================================================
 #define kSig 0x0A585654 // "TVX\n"
+
+typedef struct { // file header, followed by ntract records
+	uint32_t signature, dim[3];
+	float srow_x[4], srow_y[4], srow_z[4];
+	uint32_t ntract;
+} tvx_header;
+
+typedef struct { // record header, followed by uint32 offsets[noffset] and the stream padded to 4 bytes
+	char name[64];
+	uint32_t noffset, nbytes;
+} tract_header;
+_Static_assert(sizeof(tvx_header) == 68 && sizeof(tract_header) == 72, "no padding expected");
+
+typedef struct {
+	const tract_header *h;
+	const uint32_t *offsets; // byte offsets into stream; offsets[noffset-1] == nbytes
+	const uint8_t *stream;
+} tract_t;
 
 typedef struct {
 	tvx_header h;
-	uint32_t *offsets, *verts;
+	tract_t *tracts;
+	uint8_t *buf; // owned
+	size_t len;   // bytes of buf actually used by header + records
+	int64_t nvox, tab[27];
 } tvx_t;
 
-// ---- voxel codec: 27 neighbour codes (13 = same voxel, only at a streamline boundary)
-//      + escape 27 followed by zigzag LEB128 delta
+typedef struct {
+	nifti_1_header hdr;
+	uint8_t *img; // 0/1 per voxel
+} mask_t;
+
+// codes 0..26 are the 27 offsets (dx,dy,dz) in {-1,0,1}^3; code 27 escapes to a zigzag LEB128 delta
 static void neighbour_table(int64_t tab[27], int nx, int ny) {
 	for (int c = 0; c < 27; c++)
 		tab[c] = (c % 3 - 1) + (int64_t)(c / 3 % 3 - 1) * nx + (int64_t)(c / 9 - 1) * nx * ny;
 }
 
-static size_t delta_encode(const tvx_t *t, uint8_t *out) {
-	int64_t tab[27];
-	neighbour_table(tab, t->h.dim[0], t->h.dim[1]);
-	uint8_t *p = out;
-	int64_t prev = 0;
-	for (uint32_t i = 0; i < t->h.nvoxel; i++) {
-		int64_t d = (int64_t)t->verts[i] - prev;
-		prev = t->verts[i];
-		int c = 0;
-		while (c < 27 && tab[c] != d)
-			c++;
-		*p++ = c;
-		if (c == 27) {
-			uint64_t z = ((uint64_t)d << 1) ^ (uint64_t)(d >> 63);
-			for (; z >= 0x80; z >>= 7)
-				*p++ = 0x80 | (z & 0x7F);
-			*p++ = z;
-		}
-	}
-	return p - out;
-}
-
-// false if any decoded index is outside the volume (corrupt or foreign file)
-static bool delta_decode(tvx_t *t, const uint8_t *in) {
-	int64_t tab[27];
-	neighbour_table(tab, t->h.dim[0], t->h.dim[1]);
-	int64_t nvox = (int64_t)t->h.dim[0] * t->h.dim[1] * t->h.dim[2];
-	int64_t prev = 0;
-	for (uint32_t i = 0; i < t->h.nvoxel; i++) {
-		int c = *in++;
+// One streamline: uint32 first voxel, then one code per further voxel.
+// Returns 1 when a voxel is in img, 0 when none is, -1 when the bytes are not a valid stream.
+static int walk(const uint8_t *p, const uint8_t *end, const tvx_t *t, const uint8_t *img) {
+	if (end - p < 4)
+		return -1;
+	uint32_t first;
+	memcpy(&first, p, 4);
+	int64_t v = first;
+	p += 4;
+	for (;;) {
+		if (v < 0 || v >= t->nvox)
+			return -1;
+		if (img[v])
+			return 1;
+		if (p == end)
+			return 0;
+		int c = *p++;
 		if (c < 27)
-			prev += tab[c];
+			v += t->tab[c];
 		else {
 			uint64_t z = 0;
-			for (int shift = 0; shift < 35; shift += 7) { // at most 5 bytes: |delta| < 2^32
-				uint8_t b = *in++;
-				z |= (uint64_t)(b & 0x7F) << shift;
-				if (!(b & 0x80)) break;
+			for (int s = 0; s < 35; s += 7) { // at most 5 bytes: |delta| < 2^32
+				if (p == end)
+					return -1;
+				uint8_t b = *p++;
+				z |= (uint64_t)(b & 0x7F) << s;
+				if (!(b & 0x80))
+					break;
 			}
-			prev += (int64_t)(z >> 1) ^ -(int64_t)(z & 1);
+			v += (int64_t)(z >> 1) ^ -(int64_t)(z & 1);
 		}
-		if (prev < 0 || prev >= nvox)
-			return false;
-		t->verts[i] = prev;
 	}
-	return true;
 }
 
-// ---- conversion: streamline vertices (mm) -> voxel index runs
+EXPORT void tvx_close(tvx_t *t) {
+	if (!t)
+		return;
+	free(t->tracts);
+	free(t->buf);
+	free(t);
+}
+
+// Takes ownership of buf. Validates structure (sizes, offsets); stream contents are checked as they are walked.
+EXPORT tvx_t *tvx_open(uint8_t *buf, size_t len) {
+	tvx_t *t = calloc(1, sizeof(tvx_t));
+	t->buf = buf;
+	if (len < sizeof(tvx_header))
+		goto bad;
+	memcpy(&t->h, buf, sizeof(tvx_header));
+	if (t->h.signature != kSig)
+		goto bad;
+	t->tracts = calloc(t->h.ntract, sizeof(tract_t));
+	size_t p = sizeof(tvx_header);
+	for (uint32_t k = 0; k < t->h.ntract; k++) {
+		tract_t *tr = &t->tracts[k];
+		if (len - p < sizeof(tract_header))
+			goto bad;
+		tr->h = (const tract_header *)(buf + p);
+		p += sizeof(tract_header);
+		size_t noffset = tr->h->noffset, nbytes = ((size_t)tr->h->nbytes + 3) & ~(size_t)3;
+		if (noffset < 1 || !memchr(tr->h->name, 0, sizeof(tr->h->name)) || (len - p) / 4 < noffset || len - p - 4 * noffset < nbytes)
+			goto bad;
+		tr->offsets = (const uint32_t *)(buf + p);
+		tr->stream = buf + p + 4 * noffset;
+		p += 4 * noffset + nbytes;
+		if (tr->offsets[0] != 0 || tr->offsets[noffset - 1] != tr->h->nbytes)
+			goto bad;
+		for (size_t i = 1; i < noffset; i++)
+			if (tr->offsets[i] < tr->offsets[i - 1])
+				goto bad;
+	}
+	t->len = p;
+	t->nvox = (int64_t)t->h.dim[0] * t->h.dim[1] * t->h.dim[2];
+	neighbour_table(t->tab, t->h.dim[0], t->h.dim[1]);
+	return t;
+bad:
+	printf("Not a valid TVX file\n");
+	tvx_close(t);
+	return NULL;
+}
+
+EXPORT int tvx_ntract(const tvx_t *t) {
+	return t->h.ntract;
+}
+
+EXPORT const char *tvx_name(const tvx_t *t, int k) {
+	return t->tracts[k].h->name;
+}
+
+EXPORT void mask_close(mask_t *m) {
+	if (!m)
+		return;
+	free(m->img);
+	free(m);
+}
+
+// buf is an uncompressed NIfTI-1 image (header + voxels); any non-zero voxel is in the mask. buf is not kept.
+EXPORT mask_t *mask_open(const uint8_t *buf, size_t len) {
+	mask_t *m = calloc(1, sizeof(mask_t));
+	if (len < sizeof(nifti_1_header)) {
+		printf("Not a NIfTI image\n");
+		return mask_close(m), NULL;
+	}
+	memcpy(&m->hdr, buf, sizeof(nifti_1_header));
+	nifti_1_header *h = &m->hdr;
+	if (h->sizeof_hdr != 348) {
+		printf("Not a native-endian NIfTI-1 image (solution: use niimath)\n");
+		return mask_close(m), NULL;
+	}
+	int bpp = h->datatype == DT_UINT8 ? 1 : h->datatype == DT_INT16 || h->datatype == DT_UINT16 ? 2 : h->datatype == DT_FLOAT32 ? 4 : 0;
+	if (bpp == 0 || h->dim[1] < 1 || h->dim[2] < 1 || h->dim[3] < 1) {
+		printf("Unsupported datatype %d or dimensions (solution: use niimath)\n", h->datatype);
+		return mask_close(m), NULL;
+	}
+	size_t nvox = (size_t)h->dim[1] * h->dim[2] * h->dim[3];
+	if (!(h->vox_offset >= 348) || (size_t)h->vox_offset + nvox * bpp > len) {
+		printf("Truncated NIfTI image\n");
+		return mask_close(m), NULL;
+	}
+	const uint8_t *raw = buf + (size_t)h->vox_offset;
+	m->img = malloc(nvox);
+	for (size_t i = 0; i < nvox; i++)
+		m->img[i] = bpp == 1 ? raw[i] != 0 : bpp == 2 ? ((const uint16_t *)raw)[i] != 0 : ((const float *)raw)[i] != 0;
+	return m;
+}
+
+static bool same_grid(const tvx_header *a, const nifti_1_header *hdr) {
+	bool ok = true;
+	for (int i = 0; i < 3; i++)
+		ok &= a->dim[i] == (uint32_t)hdr->dim[i + 1];
+	for (int i = 0; i < 4; i++)
+		ok &= a->srow_x[i] == hdr->srow_x[i] && a->srow_y[i] == hdr->srow_y[i] && a->srow_z[i] == hdr->srow_z[i];
+	if (!ok) {
+		printf("NIfTI and TVX grids differ (use fslhd for NIfTI):\n");
+		printf(" dim123: %u %u %u\n", a->dim[0], a->dim[1], a->dim[2]);
+		printf(" sto_xyz1: %g %g %g %g\n", a->srow_x[0], a->srow_x[1], a->srow_x[2], a->srow_x[3]);
+		printf(" sto_xyz2: %g %g %g %g\n", a->srow_y[0], a->srow_y[1], a->srow_y[2], a->srow_y[3]);
+		printf(" sto_xyz3: %g %g %g %g\n", a->srow_z[0], a->srow_z[1], a->srow_z[2], a->srow_z[3]);
+	}
+	return ok;
+}
+
+// Fraction of streamlines of tract k touching the mask. -1 on grid mismatch or corrupt stream; NaN if the tract is empty.
+EXPORT float tvx_query(const tvx_t *t, int k, const mask_t *m) {
+	if (k < 0 || k >= (int)t->h.ntract || !same_grid(&t->h, &m->hdr))
+		return -1;
+	const tract_t *tr = &t->tracts[k];
+	uint32_t n = tr->h->noffset - 1, hits = 0;
+	for (uint32_t i = 0; i < n; i++) {
+		int r = walk(tr->stream + tr->offsets[i], tr->stream + tr->offsets[i + 1], t, m->img);
+		if (r < 0) {
+			printf("Corrupt stream in tract %s\n", tr->h->name);
+			return -1;
+		}
+		hits += r;
+	}
+	return (float)hits / (float)n;
+}
+
+#ifndef __EMSCRIPTEN__
+// ============================================================================
+// Command line: file I/O, TRK/TCK conversion, packing
+// ============================================================================
+
+// whole file into memory; gzread reads plain and gzipped files alike
+static uint8_t *read_file(const char *fnm, size_t *len) {
+	gzFile fgz = gzopen(fnm, "rb");
+	if (!fgz) {
+		printf("Unable to open %s\n", fnm);
+		return NULL;
+	}
+	gzbuffer(fgz, 1 << 20);
+	FILE *fp = fopen(fnm, "rb"); // on-disk size: exact for plain files, a lower bound for gzipped ones
+	fseek(fp, 0, SEEK_END);
+	size_t cap = ftell(fp) + 1, n = 0;
+	fclose(fp);
+	uint8_t *buf = malloc(cap);
+	int got;
+	while ((got = gzread(fgz, buf + n, cap - n)) > 0) {
+		n += got;
+		if (n == cap)
+			buf = realloc(buf, cap *= 2);
+	}
+	gzclose(fgz);
+	*len = n;
+	return buf;
+}
+
+// ---- conversion: streamline vertices (mm) -> voxel codes
 typedef struct {
-	tvx_t t;
-	size_t vcap, ocap, nvert; // nvert counts input vertices
+	tvx_header h;
+	tract_header th;
+	uint8_t *stream;
+	size_t scap;
+	uint32_t *offsets;
+	size_t ocap, nvert, nvoxel; // stats
+	int64_t tab[27];
 	int prev;
 	bool has_prev;
 	float pv[3]; // previous vertex, continuous voxel coords
 	mat44 inv;   // mm (or TRK voxmm) -> voxel
 } tvx_writer;
 
-static void writer_init(tvx_writer *w, nifti_1_header *hdr, mat44 inv) {
+static void writer_init(tvx_writer *w, const char *fnm, nifti_1_header *hdr, mat44 inv) {
 	memset(w, 0, sizeof(*w));
-	w->t.h.signature = kSig;
-	for (int i = 0; i < 3; i++) w->t.h.dim[i] = hdr->dim[i + 1];
+	w->h.signature = kSig;
+	w->h.ntract = 1;
+	for (int i = 0; i < 3; i++) w->h.dim[i] = hdr->dim[i + 1];
 	for (int i = 0; i < 4; i++) {
-		w->t.h.srow_x[i] = hdr->srow_x[i];
-		w->t.h.srow_y[i] = hdr->srow_y[i];
-		w->t.h.srow_z[i] = hdr->srow_z[i];
+		w->h.srow_x[i] = hdr->srow_x[i];
+		w->h.srow_y[i] = hdr->srow_y[i];
+		w->h.srow_z[i] = hdr->srow_z[i];
 	}
+	char *nm = strdup(basenamex(fnm));
+	strip_ext(nm);
+	strncpy(w->th.name, nm, sizeof(w->th.name) - 1);
+	free(nm);
+	neighbour_table(w->tab, w->h.dim[0], w->h.dim[1]);
 	w->inv = inv;
 	w->prev = -1;
 	w->ocap = 1 << 16;
-	w->t.offsets = malloc(w->ocap * sizeof(uint32_t));
-	w->t.offsets[0] = 0;
-	w->t.h.noffset = 1;
+	w->offsets = malloc(w->ocap * sizeof(uint32_t));
+	w->offsets[0] = 0;
+	w->th.noffset = 1;
+}
+
+static void put(tvx_writer *w, uint8_t b) {
+	if (w->th.nbytes == w->scap)
+		w->stream = realloc(w->stream, w->scap = w->scap ? 2 * w->scap : 1 << 20);
+	w->stream[w->th.nbytes++] = b;
 }
 
 static void emit(tvx_writer *w, int x, int y, int z) {
-	uint32_t *dim = w->t.h.dim;
+	uint32_t *dim = w->h.dim;
 	if (x < 0 || y < 0 || z < 0 || x >= (int)dim[0] || y >= (int)dim[1] || z >= (int)dim[2])
 		return;
 	int vxl = x + y * dim[0] + z * dim[0] * dim[1];
 	if (vxl == w->prev)
 		return;
-	w->prev = vxl;
-	if (w->t.h.nvoxel == w->vcap) {
-		w->vcap = w->vcap ? 2 * w->vcap : 1 << 20;
-		w->t.verts = realloc(w->t.verts, w->vcap * sizeof(uint32_t));
+	if (w->prev < 0) { // first voxel of a streamline is absolute
+		for (int i = 0; i < 4; i++)
+			put(w, (uint32_t)vxl >> (8 * i));
+	} else {
+		int64_t d = (int64_t)vxl - w->prev;
+		int c = 0;
+		while (c < 27 && w->tab[c] != d)
+			c++;
+		put(w, c);
+		if (c == 27) {
+			uint64_t z = ((uint64_t)d << 1) ^ (uint64_t)(d >> 63);
+			for (; z >= 0x80; z >>= 7)
+				put(w, 0x80 | (z & 0x7F));
+			put(w, z);
+		}
 	}
-	w->t.verts[w->t.h.nvoxel++] = vxl;
+	w->prev = vxl;
+	w->nvoxel++;
 }
 
 // Amanatides & Woo grid traversal: every voxel the segment a->b crosses.
@@ -346,12 +503,12 @@ static void add_vertex(tvx_writer *w, const float *xyz) {
 }
 
 static void end_streamline(tvx_writer *w) {
-	uint32_t n = w->t.h.noffset;
-	if (w->t.h.nvoxel > w->t.offsets[n - 1]) { // drop streamlines with no in-volume voxel
+	uint32_t n = w->th.noffset;
+	if (w->th.nbytes > w->offsets[n - 1]) { // drop streamlines with no in-volume voxel
 		if (n == w->ocap)
-			w->t.offsets = realloc(w->t.offsets, (w->ocap *= 2) * sizeof(uint32_t));
-		w->t.offsets[n] = w->t.h.nvoxel;
-		w->t.h.noffset++;
+			w->offsets = realloc(w->offsets, (w->ocap *= 2) * sizeof(uint32_t));
+		w->offsets[n] = w->th.nbytes;
+		w->th.noffset++;
 	}
 	w->has_prev = false;
 	w->prev = -1;
@@ -367,17 +524,16 @@ static void write_tvx(const char *fnm, tvx_writer *w) {
 		printf("Unable to write %s\n", outnm);
 		exit(EXIT_FAILURE);
 	}
-	tvx_t *t = &w->t;
-	fwrite(&t->h, sizeof(t->h), 1, fp);
-	fwrite(t->offsets, sizeof(uint32_t), t->h.noffset, fp);
-	uint8_t *buf = malloc((size_t)t->h.nvoxel * 6); // worst case: escape + 5-byte varint (|delta| < 2^32)
-	fwrite(buf, 1, delta_encode(t, buf), fp);
-	free(buf);
+	fwrite(&w->h, sizeof(w->h), 1, fp);
+	fwrite(&w->th, sizeof(w->th), 1, fp);
+	fwrite(w->offsets, sizeof(uint32_t), w->th.noffset, fp);
+	fwrite(w->stream, 1, w->th.nbytes, fp);
+	fwrite("\0\0\0", 1, (4 - w->th.nbytes % 4) % 4, fp);
 	fclose(fp);
-	printf("%s\t%u\tstreamlines\t%zu\tvertices\t%u\tvoxels\n", outnm, t->h.noffset - 1, w->nvert, t->h.nvoxel);
+	printf("%s\t%u\tstreamlines\t%zu\tvertices\t%zu\tvoxels\n", outnm, w->th.noffset - 1, w->nvert, w->nvoxel);
 	free(outnm);
-	free(t->offsets);
-	free(t->verts);
+	free(w->offsets);
+	free(w->stream);
 }
 
 static int load_trk(const char *fnm, nifti_1_header *hdr) {
@@ -405,7 +561,7 @@ static int load_trk(const char *fnm, nifti_1_header *hdr) {
 		0, 0, 1.0 / thdr.voxel_size[2], -0.5);
 	mat44 vox2mm = nifti_mat44_mul(thdr.vox_to_ras, zoomMat);
 	tvx_writer w;
-	writer_init(&w, hdr, nifti_mat44_mul(nifti_mat44_inverse(sform(hdr)), vox2mm));
+	writer_init(&w, fnm, hdr, nifti_mat44_mul(nifti_mat44_inverse(sform(hdr)), vox2mm));
 	int stride = 3 + thdr.n_scalars;
 	float *buf = NULL;
 	size_t bufcap = 0;
@@ -440,7 +596,7 @@ static int load_tck(const char *fnm, nifti_1_header *hdr) {
 		}
 	} while (strcmp(line, "END\n") != 0);
 	tvx_writer w;
-	writer_init(&w, hdr, nifti_mat44_inverse(sform(hdr)));
+	writer_init(&w, fnm, hdr, nifti_mat44_inverse(sform(hdr)));
 	float xyz[3];
 	while (fread(xyz, sizeof(xyz), 1, fp) == 1) {
 		if (isfinite(xyz[0])) {
@@ -457,62 +613,45 @@ static int load_tck(const char *fnm, nifti_1_header *hdr) {
 	return EXIT_SUCCESS;
 }
 
-// ---- query
-static bool read_tvx(const char *fnm, tvx_t *t) {
-	// gzread transparently reads both raw and gzipped files
-	gzFile fgz = gzopen(fnm, "rb");
-	if (!fgz || gzread(fgz, &t->h, sizeof(t->h)) != sizeof(t->h) || t->h.signature != kSig || t->h.noffset < 1) {
-		printf("Not a TVX file: %s\n", fnm);
-		return false;
+static tvx_t *open_tvx_file(const char *fnm) {
+	size_t len;
+	uint8_t *buf = read_file(fnm, &len);
+	tvx_t *t = buf ? tvx_open(buf, len) : NULL;
+	if (!t) {
+		printf("Unable to load %s\n", fnm);
+		exit(EXIT_FAILURE);
 	}
-	gzbuffer(fgz, 1 << 20);
-	t->offsets = malloc(sizeof(uint32_t) * t->h.noffset);
-	t->verts = malloc(sizeof(uint32_t) * t->h.nvoxel);
-	uint8_t *buf = malloc((size_t)t->h.nvoxel * 6);
-	bool ok = gzread(fgz, t->offsets, sizeof(uint32_t) * t->h.noffset) == (int)(sizeof(uint32_t) * t->h.noffset);
-	ok = ok && gzread(fgz, buf, (size_t)t->h.nvoxel * 6) > 0 && delta_decode(t, buf);
-	for (uint32_t i = 1; ok && i < t->h.noffset; i++)
-		ok = t->offsets[i - 1] <= t->offsets[i] && t->offsets[i] <= t->h.nvoxel;
-	free(buf);
-	gzclose(fgz);
-	if (!ok)
-		printf("Corrupt TVX file: %s\n", fnm);
-	return ok;
+	return t;
 }
 
-static void free_tvx(tvx_t *t) {
-	free(t->offsets);
-	free(t->verts);
-	t->offsets = t->verts = NULL;
-}
-
-static bool tvx_matches(const tvx_t *t, const nifti_1_header *hdr) {
-	bool ok = true;
-	for (int i = 0; i < 3; i++)
-		ok &= t->h.dim[i] == (uint32_t)hdr->dim[i + 1];
-	for (int i = 0; i < 4; i++)
-		ok &= t->h.srow_x[i] == hdr->srow_x[i] && t->h.srow_y[i] == hdr->srow_y[i] && t->h.srow_z[i] == hdr->srow_z[i];
-	if (!ok) {
-		printf("NIfTI and TVX do not match (use fslhd for NIfTI):\n");
-		printf(" dim123: %u %u %u\n", t->h.dim[0], t->h.dim[1], t->h.dim[2]);
-		printf(" sto_xyz1: %g %g %g %g\n", t->h.srow_x[0], t->h.srow_x[1], t->h.srow_x[2], t->h.srow_x[3]);
-		printf(" sto_xyz2: %g %g %g %g\n", t->h.srow_y[0], t->h.srow_y[1], t->h.srow_y[2], t->h.srow_y[3]);
-		printf(" sto_xyz3: %g %g %g %g\n", t->h.srow_z[0], t->h.srow_z[1], t->h.srow_z[2], t->h.srow_z[3]);
+// concatenate the records of several TVX files sharing one grid into a single file
+static void pack(const char *outnm, int n, char **fnms) {
+	tvx_t **in = malloc(n * sizeof(tvx_t *));
+	tvx_header h;
+	for (int i = 0; i < n; i++) {
+		in[i] = open_tvx_file(fnms[i]);
+		if (i == 0)
+			h = in[0]->h;
+		else if (memcmp(&in[i]->h, &h, offsetof(tvx_header, ntract)) != 0) {
+			printf("Grid of %s differs from %s\n", fnms[i], fnms[0]);
+			exit(EXIT_FAILURE);
+		}
+		if (i > 0)
+			h.ntract += in[i]->h.ntract;
 	}
-	return ok;
-}
-
-// fraction of streamlines touching any non-zero voxel of img
-static float query_tvx(const tvx_t *t, const uint8_t *img) {
-	uint32_t nstreamline = t->h.noffset - 1;
-	uint32_t hits = 0;
-	for (uint32_t i = 0; i < nstreamline; i++)
-		for (uint32_t j = t->offsets[i]; j < t->offsets[i + 1]; j++)
-			if (img[t->verts[j]]) {
-				hits++;
-				break;
-			}
-	return (float)hits / (float)nstreamline;
+	FILE *fp = fopen(outnm, "wb");
+	if (!fp) {
+		printf("Unable to write %s\n", outnm);
+		exit(EXIT_FAILURE);
+	}
+	fwrite(&h, sizeof(h), 1, fp);
+	for (int i = 0; i < n; i++) {
+		fwrite(in[i]->buf + sizeof(tvx_header), 1, in[i]->len - sizeof(tvx_header), fp);
+		tvx_close(in[i]);
+	}
+	fclose(fp);
+	free(in);
+	printf("%s\t%u\ttracts\n", outnm, h.ntract);
 }
 
 static void show_help(char *fname) {
@@ -521,11 +660,12 @@ static void show_help(char *fname) {
 	printf("Usage to create TVX file(s)\n");
 	printf(" %s template.nii tracks1.tck tracks2.tck\n", fname);
 	printf(" %s template.nii tracks1.trk\n", fname);
+	printf("Usage to pack TVX files into one\n");
+	printf(" %s -p atlas.tvx tracks1.tvx tracks2.tvx\n", fname);
 	printf("Usage to compute lesion overlap(s) with TVX file(s)\n");
-	printf(" %s lesion.nii tracks1.tvx tracks2.tvx\n", fname);
+	printf(" %s lesion.nii atlas.tvx\n", fname);
 	printf(" %s lesion1.nii lesion2.nii tracks1.tvx tracks2.tvx\n", fname);
-	printf(" %s ./imgs/w*lesion.nii.gz ./tvx/*.tvx > results.tsv\n", fname);
-	printf(" -m: low memory, re-read each TVX per lesion instead of keeping all in RAM\n");
+	printf(" %s ./imgs/w*lesion.nii.gz atlas.tvx > results.tsv\n", fname);
 	exit(EXIT_FAILURE);
 }
 
@@ -534,86 +674,86 @@ static bool is_nifti(const char *fnm) {
 }
 
 int main(int argc, char **argv) {
-	bool lowmem = false;
-	int first = 1;
-	for (; first < argc && argv[first][0] == '-'; first++) {
-		if (strcmp(argv[first], "-m") == 0) lowmem = true;
-		else show_help(argv[0]);
+	if (argc < 3 || (argv[1][0] == '-' && strcmp(argv[1], "-p") != 0))
+		show_help(argv[0]);
+	if (strcmp(argv[1], "-p") == 0) {
+		if (argc < 4)
+			show_help(argv[0]);
+		pack(argv[2], argc - 3, argv + 3);
+		return EXIT_SUCCESS;
 	}
-	int nnifti = 0, ntrack = 0;
-	for (int i = first; i < argc; i++) {
+	int nnifti = 0, ntrack = 0, ntvx = 0;
+	for (int i = 1; i < argc; i++) {
 		if (access(argv[i], F_OK) != 0) {
 			printf("Unable to find file named '%s'\n", argv[i]);
 			exit(EXIT_FAILURE);
 		}
 		if (is_nifti(argv[i])) nnifti++;
 		else ntrack++;
+		ntvx += is_ext(argv[i], ".tvx");
 	}
 	if (nnifti == 0 || ntrack == 0) {
 		printf("Arguments must include at least one NIfTI image and at least one tractography file (TCK, TRK, TVX)\n");
 		show_help(argv[0]);
 	}
-	tvx_t *tvx = calloc(argc, sizeof(tvx_t)); // indexed by argv position, loaded on first use
-	float *fracs = malloc(sizeof(float) * argc);
-	int *idxs = malloc(sizeof(int) * argc);
+	tvx_t **tvx = calloc(argc, sizeof(tvx_t *)); // indexed by argv position, loaded once
 	bool header_written = false, is_template = true; // TRK/TCK are converted once, against the first NIfTI
-	for (int i = first; i < argc; i++) {
+	for (int i = 1; i < argc; i++) {
 		if (!is_nifti(argv[i]))
 			continue;
-		nifti_1_header hdr;
-		uint8_t *img = load_nii_mask(argv[i], &hdr);
-		if (img == NULL)
+		size_t len;
+		uint8_t *buf = read_file(argv[i], &len);
+		mask_t *m = buf ? mask_open(buf, len) : NULL;
+		free(buf);
+		if (!m)
 			exit(EXIT_FAILURE);
-		int nfrac = 0;
-		for (int j = first; j < argc; j++) {
-			if (is_nifti(argv[j]))
-				continue;
-			if (is_ext(argv[j], ".tck") || is_ext(argv[j], ".trk")) {
-				if (is_template && (is_ext(argv[j], ".tck") ? load_tck : load_trk)(argv[j], &hdr) != EXIT_SUCCESS) {
+		if (is_template)
+			for (int j = 1; j < argc; j++) {
+				if (is_nifti(argv[j]) || is_ext(argv[j], ".tvx"))
+					continue;
+				if (!is_ext(argv[j], ".tck") && !is_ext(argv[j], ".trk")) {
+					printf("Extension unknown %s\n", argv[j]);
+					exit(EXIT_FAILURE);
+				}
+				if ((is_ext(argv[j], ".tck") ? load_tck : load_trk)(argv[j], &m->hdr) != EXIT_SUCCESS) {
 					printf("Unable to convert %s\n", argv[j]);
 					exit(EXIT_FAILURE);
 				}
-			} else if (is_ext(argv[j], ".tvx")) {
-				if (!tvx[j].verts && !read_tvx(argv[j], &tvx[j]))
-					exit(EXIT_FAILURE);
-				if (!tvx_matches(&tvx[j], &hdr))
-					exit(EXIT_FAILURE);
-				fracs[nfrac] = query_tvx(&tvx[j], img);
-				idxs[nfrac++] = j;
-				if (lowmem)
-					free_tvx(&tvx[j]);
-			} else {
-				printf("Extension unknown %s\n", argv[j]);
-				exit(EXIT_FAILURE);
 			}
-		}
-		free(img);
 		is_template = false;
-		if (nfrac == 0)
+		if (ntvx == 0) {
+			mask_close(m);
 			continue;
+		}
 		if (!header_written) {
 			header_written = true;
 			printf("id");
-			for (int k = 0; k < nfrac; k++) {
-				char *basenm = strdup(argv[idxs[k]]);
-				strip_ext2(basenm);
-				printf("\t%s", basenamex(basenm));
-				free(basenm);
-			}
+			for (int j = 1; j < argc; j++)
+				if (is_ext(argv[j], ".tvx")) {
+					tvx[j] = open_tvx_file(argv[j]);
+					for (int k = 0; k < tvx_ntract(tvx[j]); k++)
+						printf("\t%s", tvx_name(tvx[j], k));
+				}
 			printf("\n");
 		}
 		char *basenm = strdup(argv[i]);
 		strip_ext2(basenm);
 		printf("%s", basenamex(basenm));
 		free(basenm);
-		for (int k = 0; k < nfrac; k++)
-			printf("\t%g", fracs[k]);
+		for (int j = 1; j < argc; j++)
+			if (tvx[j])
+				for (int k = 0; k < tvx_ntract(tvx[j]); k++) {
+					float frac = tvx_query(tvx[j], k, m);
+					if (frac < 0)
+						exit(EXIT_FAILURE);
+					printf("\t%g", frac);
+				}
 		printf("\n");
+		mask_close(m);
 	}
-	for (int j = first; j < argc; j++)
-		free_tvx(&tvx[j]);
+	for (int j = 1; j < argc; j++)
+		tvx_close(tvx[j]);
 	free(tvx);
-	free(fracs);
-	free(idxs);
-	exit(EXIT_SUCCESS);
+	return EXIT_SUCCESS;
 }
+#endif // __EMSCRIPTEN__

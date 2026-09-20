@@ -1,8 +1,9 @@
 # AGENTS.md
 
-Single-file C tool (`nii2tvx.c`) plus two Python wrappers. Build: `make` (gcc, zlib);
-`make sanitize` builds `nii2tvx_asan` (ASan + UBSan) so it never shadows the release binary.
-LeakSanitizer is unavailable on Apple Silicon; use `leaks --atExit` if needed.
+Single-file C tool (`nii2tvx.c`) plus two Python wrappers and a Node demo. Build: `make`
+(gcc, zlib); `make sanitize` builds `nii2tvx_asan` (ASan + UBSan) so it never shadows the
+release binary; `make wasm` (emcc) builds `nii2tvx.mjs` + `nii2tvx.wasm`. LeakSanitizer is
+unavailable on Apple Silicon; use `leaks --atExit` if needed.
 Format spec, measurements and evaluation: `tvx_format.md`. Read that before touching the
 format.
 
@@ -13,24 +14,35 @@ answer lesion queries as pure integer lookups. Anything that moves work from que
 conversion time is aligned with the design; anything that puts floating point or geometry
 back into the query path is not.
 
+The file is split in two by `#ifndef __EMSCRIPTEN__`. Above it: the core, buffer in and
+numbers out, no file I/O, no zlib. That is the whole WASM surface (`tvx_open`, `tvx_ntract`,
+`tvx_name`, `mask_open`, `tvx_query`, close). Below it: file reading, TRK/TCK conversion,
+packing and `main`. Keep it that way; the WASM build must never need a filesystem.
+
 ## Mode selection is by file extension
 
 `main` scans argv: `.nii`/`.nii.gz` are images, everything else is a tractogram. `.trk`/`.tck`
 inputs trigger conversion (image = template), `.tvx` inputs trigger queries (image = lesion).
-The only flag is `-m` (low-memory query, re-read per lesion) and it must come first.
-Anything else starting with `-` prints help.
+`-p out.tvx a.tvx b.tvx` packs records into one file and must be the first argument.
+Anything else starting with `-` prints help. There is no `-m`: the query walks the file
+bytes in place, so RAM is already the file size.
 
 ## Gotchas
 
-- **Voxels are delta coded on disk, uint32 in RAM.** `read_tvx` decodes the whole byte
-  stream at load; `query_tvx` only ever sees the decoded array. RAM is 4 bytes per entry
-  regardless of the ~1 byte on disk.
-- **Signature is uppercase `TVX\n`.** Files written by the pre-release raw-uint32 build
-  used lowercase `tvx\n` and are rejected as "Not a TVX file"; regenerate them.
-- **`read_tvx` is the one trust boundary.** It checks the signature, the gzread lengths,
-  offset monotonicity and that every decoded index is inside `dim`. Nothing downstream
-  re-checks, and `query_tvx` indexes the mask with file data directly, so keep those
-  checks when editing the reader.
+- **The file is the data structure.** `tvx_open` only validates and sets pointers into the
+  buffer it was handed; `walk` decodes each streamline on the fly during the query. There
+  is no decoded array anywhere. Each streamline starts with an absolute uint32 so a walk
+  can start at any `offsets[i]` and early-exit without touching the rest.
+- **Signature is uppercase `TVX\n`.** Files written by the pre-release builds (raw uint32,
+  or delta without the record layout) are rejected as "Not a valid TVX file"; regenerate.
+- **Trust boundary is split in two on purpose.** `tvx_open` checks structure (sizes,
+  names, offsets) once; `walk` checks content (index range, varint bounds) per entry
+  because a corrupt stream can only be detected by decoding it. `tvx_query` returns -1 on
+  either; `nan` means a legitimately empty tract, so do not conflate them.
+- **Neighbour codes are relative to `dim`**, so a record only decodes against its own file
+  header. `pack` therefore refuses inputs whose header differs.
+- **`mask_open` takes uncompressed NIfTI bytes.** The CLI gunzips through `gzread` in
+  `read_file`; the WASM host must gunzip itself (`wasm_demo.mjs` uses Node `zlib`).
 - **Vertices that are NaN, Inf or beyond ±1e6 voxels are skipped** in `add_vertex` and
   break the streamline there; `raster` would otherwise spin forever (Inf gives a zero
   step, huge values stall below float epsilon).
@@ -61,22 +73,24 @@ Anything else starting with `-` prints help.
   are lesions only. A failed conversion aborts the run.
 - **Masks are binarised from the raw voxel values**, ignoring `scl_slope`/`scl_inter`, so
   an intercept cannot turn background into lesion.
-- **Load-once is the default.** All TVX files stay in RAM across lesions (≈ 400 MB for the
-  atlas). `-m` frees each after use: half the speed, peak memory of the largest file.
+- **All TVX files are opened once**, on the first lesion, and stay mapped for every later
+  lesion. Peak RAM is the sum of file sizes plus one mask.
 - **Output TSV goes to stdout together with diagnostic prints.** Conversion prints one line
   per file; query mode prints only the table, header row once. `lesion2tvx.py -o`
   post-processes stdout and expects the first column to be `id`.
-- **`write_tvx` writes next to the input** with the extension replaced by `.tvx`.
-  `hcp2tvx.py` deletes and recreates both data directories on every run.
-- **Untracked data is large.** `hcp1065_avg_tracts_trk/` (1.7 GB), the zip (588 MB) and
-  `hcp1065_avg_tracts_tvx/` live in the working tree and are gitignored.
+- **`write_tvx` writes next to the input** with the extension replaced by `.tvx`, one
+  record named after the input file. `hcp2tvx.py` deletes and recreates both data
+  directories on every run, then packs everything into `hcp1065_avg_tracts.tvx`.
+- **Untracked data is large.** `hcp1065_avg_tracts_trk/` (1.7 GB), the zip (588 MB),
+  `hcp1065_avg_tracts_tvx/` and `hcp1065_avg_tracts.tvx` live in the working tree and are
+  gitignored, as are the emcc outputs.
 
 ## Reference numbers (HCP1065, 88 tracts, rasterised)
 
-503 k streamlines, 84 M voxel entries, 84 MB on disk, ≈ 50 ms per lesion, whole-atlas
-conversion ≈ 4 s. Use these as a regression baseline when changing the format or the query
-loop. The three lesions in `example/` against the atlas make a quick check: results must be
-identical between default and `-m`.
+503 k streamlines, 84 M voxel entries, 88 MB packed, ≈ 65 ms per lesion, whole-atlas
+conversion ≈ 4 s, WASM module 19 KB. Use these as a regression baseline when changing the
+format or the query loop. The three lesions in `example/` against the packed atlas make a
+quick check: the packed file, the individual files and `node wasm_demo.mjs` must all agree.
 
 ## Style
 

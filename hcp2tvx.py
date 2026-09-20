@@ -2,7 +2,8 @@
 """
 Download the HCP1065 population-averaged tractography atlas (TRK) and convert every
 tract to TVX against MNI152_T1_1mm_brain_mask.nii.gz (looked up here, then in
-$FSLDIR/data/standard). Output lands in hcp1065_avg_tracts_tvx/ next to this script.
+$FSLDIR/data/standard). Per-tract files land in hcp1065_avg_tracts_tvx/ and all of
+them packed into one hcp1065_avg_tracts.tvx, next to this script.
 Both data folders are deleted and recreated on every run.
 """
 
@@ -60,6 +61,7 @@ def main() -> None:
     tvx_dir.mkdir()
     for tvx in trk_dir.rglob("*.tvx"):
         shutil.move(str(tvx), tvx_dir / tvx.name)
+    subprocess.run([str(exe), "-p", str(base / "hcp1065_avg_tracts.tvx"), *map(str, sorted(tvx_dir.glob("*.tvx")))], check=True)
     print(f"Wrote {tvx_dir}")
 
 

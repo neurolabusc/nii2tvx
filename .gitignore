@@ -5,3 +5,6 @@ hcp1065_avg_tracts_trk.zip
 hcp1065_avg_tracts_tvx/
 nii2tvx_asan
 *.dSYM/
+nii2tvx.mjs
+nii2tvx.wasm
+hcp1065_avg_tracts.tvx

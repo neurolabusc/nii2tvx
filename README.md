@@ -33,20 +33,20 @@ make
 - `template.nii`: NIfTI image defining voxel space and affine transform.  
 - `tracksX.trk` / `tracksX.tck`: tractography files.  
 - Output: `.tvx` files, one per input streamline file.  
+- Pack many into one self-describing atlas: `./nii2tvx -p atlas.tvx tracks1.tvx tracks2.tvx`  
 - Format details: [tvx_format.md](tvx_format.md).  
 
 ### 2. Compute lesion overlaps with TVX files
 
 ```bash
-./nii2tvx lesion.nii tracks1.tvx tracks2.tvx
+./nii2tvx lesion.nii atlas.tvx
 ./nii2tvx lesion1.nii lesion2.nii tracks1.tvx tracks2.tvx
-./nii2tvx ./imgs/w*lesion.nii.gz ./tvx/*.tvx > results.tsv
+./nii2tvx ./imgs/w*lesion.nii.gz atlas.tvx > results.tsv
 ```
 
 - `lesionX.nii`: binary lesion masks.  
-- `tracksX.tvx`: precomputed TVX files.  
+- `atlas.tvx` / `tracksX.tvx`: precomputed TVX files, one column per tract they contain.  
 - Output: TSV table of lesion–tract overlap fractions.  
-- All TVX files are kept in memory across lesions; `-m` re-reads them per lesion to minimise memory.  
 
 ## Automated TVX creation
 
@@ -57,7 +57,7 @@ You can adapt the script for other templates or streamlines.
 python hcp2tvx.py
 ```
 
-This creates `tvx` files in `hcp1065_avg_tracts_tvx/`.  
+This creates one `tvx` file per tract in `hcp1065_avg_tracts_tvx/` and packs them all into `hcp1065_avg_tracts.tvx`.  
 Use `lesion2tvx.py` to compute overlaps, providing a folder of TVX files and a folder of lesions:
 
 ```bash
@@ -70,7 +70,7 @@ python lesion2tvx.py ./lesions ./hcp1065_avg_tracts_tvx > results.tsv
 Consider the provided lesion map `wM2208_T1w_lesion.nii.gz` that has been spatially normalized to the `MNI152_T1_1mm_brain_mask.nii.gz` template. We can identify the proportion damage to all the HCP1065 tracts.
 
 ```
-nii2tvx ./example/wM2208_T1w_lesion.nii.gz ./hcp1065_avg_tracts_tvx/*.tvx > M2208.tsv
+nii2tvx ./example/wM2208_T1w_lesion.nii.gz hcp1065_avg_tracts.tvx > M2208.tsv
 ```
 This will generate a tab-separated values file.
 
@@ -102,7 +102,12 @@ Or use the Makefile:
 ```bash
 make          # optimized build
 make sanitize # ASan + UBSan build as nii2tvx_asan
+make wasm     # nii2tvx.mjs + nii2tvx.wasm (needs emcc); try: node wasm_demo.mjs lesion.nii.gz atlas.tvx
 ```
+
+## WebAssembly
+
+The query core has no file I/O, so it compiles to a 19 KB WASM module exposing six functions (open, count, name, mask, query, close). A page fetches one packed atlas and gunzips it and the lesion in JavaScript; see `wasm_demo.mjs` for the calls.
 
 ## Alternatives, References and Links
 

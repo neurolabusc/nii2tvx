@@ -1,21 +1,22 @@
 # TVX format
 
-TVX ("tract voxels") stores a tractogram after it has been snapped to the voxel grid of a
-reference NIfTI image. Each streamline becomes a list of linear voxel indices. The expensive
-step (affine transform, rasterisation, bounds checks) is done once at conversion; a lesion
-query is then a pure lookup with no floating point.
+TVX ("tract voxels") stores one or more tracts after their streamlines have been snapped
+to the voxel grid of a reference NIfTI image. Each streamline becomes a run of voxel
+indices. The expensive step (affine transform, rasterisation, bounds checks) is done once
+at conversion; a lesion query is then a byte walk with no floating point, directly on the
+file bytes.
 
 ## Layout
 
-Little endian. Three sections, back to back:
+Little endian, 4-byte aligned. A file header followed by `ntract` records:
 
 ```
-header   72 bytes
-offsets  uint32 × noffset
-voxels   byte stream, one code per entry plus escapes
+tvx_header      68 bytes
+record[0]       tract_header 72 bytes, uint32 offsets[noffset], stream[nbytes] padded to 4
+record[1]       ...
 ```
 
-### Header
+### tvx_header
 
 | Offset | Type        | Field     | Meaning |
 |-------:|-------------|-----------|---------|
@@ -24,35 +25,41 @@ voxels   byte stream, one code per entry plus escapes
 | 16     | float32[4]  | srow_x    | NIfTI sform row 0 |
 | 32     | float32[4]  | srow_y    | NIfTI sform row 1 |
 | 48     | float32[4]  | srow_z    | NIfTI sform row 2 |
-| 64     | uint32      | noffset   | number of offsets = streamlines + 1 |
-| 68     | uint32      | nvoxel    | total voxel entries across all streamlines |
+| 64     | uint32      | ntract    | number of records that follow |
 
 `dim` and the sform are a fingerprint. A query image must match them bit for bit (float
 equality), otherwise the reader refuses. This is what guarantees the precomputed voxel
-indices are valid for the lesion image. The reader additionally rejects a file whose
-offsets are not monotonic or whose decoded indices fall outside `dim`, since either means
-the file is corrupt or was made for another grid.
+indices are valid for the lesion image.
 
-### Offsets
+### tract_header
 
-CSR style. Streamline `i` occupies entries `offsets[i] .. offsets[i+1])`. `offsets[0] == 0`,
-`offsets[noffset-1] == nvoxel`. Offsets count entries, not bytes.
+| Offset | Type      | Field   | Meaning |
+|-------:|-----------|---------|---------|
+| 0      | char[64]  | name    | NUL-terminated tract name (TSV column header) |
+| 64     | uint32    | noffset | streamlines + 1 |
+| 68     | uint32    | nbytes  | length of the stream, before padding |
 
-### Voxels
+### offsets
 
-Each entry is a linear voxel index `x + y*dim[0] + z*dim[0]*dim[1]`, in streamline
-traversal order, stored as a delta from the previous entry (the last entry of the previous
-streamline across a boundary; 0 before the first entry). One code byte per entry:
+CSR style, in **bytes** into the stream. Streamline `i` occupies
+`stream[offsets[i] .. offsets[i+1])`. `offsets[0] == 0`, `offsets[noffset-1] == nbytes`.
+Byte offsets let a reader skip the rest of a streamline as soon as it has hit the mask,
+without decoding it.
+
+### stream
+
+Each streamline is independent: a uint32 absolute linear voxel index
+`x + y*dim[0] + z*dim[0]*dim[1]` for its first voxel, then one code byte per further voxel,
+each a delta from the previous voxel:
 
 - codes `0..26`: the 27 offsets `code = (dx+1) + 3(dy+1) + 9(dz+1)` with
-  `dx,dy,dz ∈ {−1,0,1}`. Code 13 (zero delta) only occurs when a streamline starts in the
-  voxel where the previous one ended.
+  `dx,dy,dz ∈ {−1,0,1}`. Code 13 (zero delta) is never written.
 - code `27`: escape, followed by the delta as a zigzag LEB128 varint
-  (`(d<<1) ^ (d>>63)`, 7 bits per byte, high bit set = more bytes follow).
+  (`(d<<1) ^ (d>>63)`, 7 bits per byte, high bit set = more bytes follow, at most 5 bytes).
 
-Nearly every within-streamline step is a neighbour move, so the stream is ≈ 1 byte per
-entry. The reader decodes the whole file into uint32 at load and the query loop works on
-the decoded array.
+Nearly every within-streamline step is a neighbour move, so a streamline costs 4 bytes plus
+about one byte per voxel. The stream is padded with zero bytes to a multiple of 4 so the
+next record's offsets are aligned.
 
 Entries are produced by the converter as follows:
 
@@ -62,7 +69,8 @@ Entries are produced by the converter as follows:
 2. Every voxel crossed by the segment between consecutive vertices is emitted, using
    Amanatides–Woo grid traversal. Voxel `v` spans `[v−0.5, v+0.5)`, so a single vertex maps
    to the nearest voxel, matching `round()`.
-3. Voxels outside `dim` are dropped.
+3. Voxels outside `dim` are dropped. Vertices that are NaN, Inf or beyond ±1e6 voxels are
+   skipped and break the streamline.
 4. Consecutive duplicates are dropped. Non-consecutive revisits are kept.
 5. Streamlines left with zero voxels are dropped entirely, so they do not appear in the
    denominator of the reported fraction.
@@ -70,10 +78,25 @@ Entries are produced by the converter as follows:
 Because of step 2 the voxel list is independent of the source step size: a 2 mm step on a
 1 mm grid has no gaps, and diagonal steps do not cut corners.
 
+### Packing
+
+`nii2tvx -p atlas.tvx a.tvx b.tvx ...` writes one file whose records are the records of the
+inputs, in order. All inputs must share `dim` and sform. Converting a TRK/TCK always
+produces a one-record file named after the input.
+
 ### gzip
 
-The reader uses `gzread`, which transparently accepts a gzipped file. The converter never
-writes gzip; gzip roughly quarters the size again.
+The command line reads gzipped files transparently. The WASM build takes uncompressed
+bytes; the host gunzips (`DecompressionStream` or Node `zlib`) first. gzip roughly quarters
+the file.
+
+## Reading
+
+Validation happens once in `tvx_open`: signature, record sizes against the buffer length,
+NUL-terminated names, `offsets[0] == 0`, monotonic offsets ending at `nbytes`. Stream
+contents are validated as they are walked: an index outside `dim` or a varint running past
+the streamline end makes the query fail. There is no decoded copy; the query walks the
+file bytes, so RAM is the file size.
 
 ## Query
 
@@ -82,64 +105,75 @@ For a binary mask `img` (any non-zero voxel counts):
 ```
 hits = 0
 for each streamline i:
-    if any(img[voxels[j]] != 0 for j in offsets[i] .. offsets[i+1]): hits++
+    v = first voxel; loop: if img[v]: hits++, break; v += next delta until offsets[i+1]
 return hits / (noffset - 1)
 ```
 
-Early exit on first hit. Output is the fraction of streamlines that touch the mask.
-All TVX files are loaded once and kept in RAM across lesions; `-m` re-reads each file per
-lesion instead, trading about 2× wall time for peak memory equal to the largest file.
+Output is the fraction of streamlines that touch the mask. A tract with no streamlines in
+the volume reports `nan`.
 
-## Reference numbers (HCP1065 atlas, MNI152 1 mm, 182×218×182, 88 tracts)
+## Core API (C and WASM)
+
+```
+tvx_t  *tvx_open(uint8_t *buf, size_t len)     takes ownership of buf; NULL if invalid
+int     tvx_ntract(tvx_t*)
+char   *tvx_name(tvx_t*, int k)
+mask_t *mask_open(const uint8_t *nii, size_t len) uncompressed NIfTI-1; NULL if invalid
+float   tvx_query(tvx_t*, int k, mask_t*)      fraction; -1 on grid mismatch or corrupt stream
+void    tvx_close(tvx_t*), mask_close(mask_t*)
+```
+
+`make wasm` exports exactly these plus `malloc`/`free`; `wasm_demo.mjs` shows the six calls
+from Node. The command-line tool is the same functions wrapped in file reading.
+
+## Reference numbers (HCP1065 atlas, MNI152 1 mm, 182×218×182, 87 tracts)
 
 | | |
 |---|---:|
 | streamlines | 503 085 |
 | voxel entries | 84.4 M |
-| disk | 84 MB (1.00 bytes per entry) |
-| gzip of all files | 22.5 MB |
+| packed atlas on disk | 88 MB (1.04 bytes per entry) |
+| packed atlas gzipped | 22 MB |
 | source TRK | 1.7 GB raw, 588 MB zip |
-| 20 lesions (18.7 k voxels each), load once / `-m` | 1.1 s / 2.1 s |
-| peak RSS, load once / `-m` | 400 MB / 150 MB |
-| conversion of the whole atlas | 4.2 s |
+| 20 lesions (18.7 k voxels each) against the packed atlas | 1.4 s |
+| one lesion, process start to exit | 0.09 s |
+| peak RSS | ≈ file size + mask |
+| WASM module | 19 KB |
+| conversion of the whole atlas | 4.3 s |
 
 # Evaluation
 
 ## What it gets right
 
 - **The core idea is sound and is the whole win.** Snapping to the grid once turns every
-  later query into integer lookups against a byte array. This is why the tool does 88 tracts
-  in tens of milliseconds while streamline-geometry tools take minutes.
-- **Simple.** Header, one offset array, one byte stream with a 28-symbol alphabet. The
-  decoder is fifteen lines.
-- **Self-validating.** Embedding `dim` and the sform prevents the silent wrong-space answers
-  that plague other tools.
-- **Lossless with respect to the query.** Nothing that affects "does streamline i touch mask
-  m" is thrown away.
-- **Compact.** About 1 byte per voxel entry, 20× smaller than the source TRK, with no
-  measurable decode cost at query time.
+  later query into byte walks against a mask. This is why the tool does 87 tracts in tens
+  of milliseconds while streamline-geometry tools take minutes.
+- **Zero-copy.** The file is the in-memory structure. Load is a read, RAM is file size, and
+  the WASM build has no decode buffer, which is what makes it viable on a phone.
+- **Self-validating.** The grid fingerprint prevents silent wrong-space answers; structural
+  checks at open and range checks during the walk reject corrupt files.
+- **Self-describing.** Tract names travel in the file, so one packed atlas replaces a
+  directory plus a naming convention, and a browser fetches one URL.
+- **Compact.** About 1 byte per voxel entry, 20× smaller than the source TRK.
 
 ## Remaining weaknesses
 
-1. **Forward layout scans the whole tract per query.** Early exit helps less than it looks:
-   for the test lesion, 82 % of entries were visited, because every streamline that misses
-   must be walked to its end. An inverted index (voxel → streamline ids) would touch ≈ 22×
-   fewer entries and its cost scales with lesion size rather than tract size. Its ids are
-   less compressible than neighbour deltas (≈ 1.5 bytes per entry with varint gaps). Worth
-   it only for whole-brain tractograms with millions of streamlines or very large cohorts;
-   for an 88-bundle atlas the current 50 ms per lesion is already dominated by process
-   start and NIfTI decompression.
-2. **No spatial bounds.** A per-tract bounding box (or bitmap) would let the query skip
-   tracts that cannot intersect the lesion. Many tracts return exactly 0 for a typical
-   lesion; today each still costs a full scan.
-3. **Sequential only.** Random access to streamline `i` requires decoding from the start.
-   Irrelevant for the query, which is a full pass, but a viewer that wants one streamline
-   would need the decoded array.
-4. **Native endian only**, and `nvoxel` is uint32, so a single tract is limited to
-   4.3 G entries. Neither has bitten yet.
+1. **Forward layout scans the whole tract per query.** For the test lesion about 82 % of
+   entries are visited, because every streamline that misses must be walked to its end.
+   An inverted index (voxel → streamline ids) would touch ≈ 22× fewer entries and its cost
+   scales with lesion size rather than tract size. Worth it only for whole-brain
+   tractograms with millions of streamlines or very large cohorts.
+2. **No spatial bounds.** A per-tract bounding box would let the query skip tracts that
+   cannot intersect the lesion. Many tracts return exactly 0 for a typical lesion; today
+   each still costs a full scan.
+3. **The grid check is bitwise.** A mask on the same grid whose sform differs in the last
+   float bit, or that carries only a qform, is refused. Correct but unfriendly for
+   browser-drawn masks; a tolerance or a resample-on-load step is the likely next request.
+4. **Native endian only**, and record sizes are uint32, so a single tract is limited to
+   4 GB of stream. Neither has bitten yet.
 
 ## Verdict
 
-For the stated goal (hundreds of lesions in seconds against a bundle atlas) the format
-meets the bar with margin. An inverted index is the next step only if a workload with
-per-lesion time above tens of milliseconds actually appears.
+For the stated goal (hundreds of lesions in seconds against a bundle atlas, natively and
+in a browser) the format meets the bar with margin. An inverted index is the next step only
+if a workload with per-lesion time above tens of milliseconds actually appears.
