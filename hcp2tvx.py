@@ -12,7 +12,9 @@ hcp2tvx.py
    After extraction, recursively gunzips any *.gz files inside the folder
    (e.g., file.trk.gz -> file.trk).
 3) Recursively searches hcp1065_avg_tracts_trk for *.trk files and runs:
-     nii2tvx MNI152_T1_1mm_brain_mask.nii.gz /path/to/file.trk
+     nii2tvx [flags] MNI152_T1_1mm_brain_mask.nii.gz /path/to/file.trk
+   Any script arguments are passed through as flags (e.g. `python hcp2tvx.py -d`
+   writes delta-encoded TVX).
    The working directory for nii2tvx is the script folder.
 4) Creates 'hcp1065_avg_tracts_tvx' in the script folder (deleting any existing one)
    and moves all generated .tvx files from hcp1065_avg_tracts_trk into it, flattening
@@ -125,7 +127,7 @@ def find_files_with_ext(root: Path, ext: str):
 
 
 def run_nii2tvx(exe: Path, mask: Path, trk: Path, cwd: Path) -> int:
-    cmd = [str(exe), str(mask), str(trk)]
+    cmd = [str(exe)] + sys.argv[1:] + [str(mask), str(trk)]
     print(f"Running: {exe.name} {mask.name} {trk}")
     try:
         proc = subprocess.run(cmd, cwd=str(cwd), check=False)
